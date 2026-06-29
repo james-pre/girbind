@@ -1,0 +1,20 @@
+{
+	"compilerOptions": {
+		"module": "NodeNext",
+		"target": "ESNext",
+		"lib": ["ESNext"],
+		"moduleResolution": "NodeNext",
+		"rootDir": "src",
+		"outDir": "dist",
+		"strict": true,
+		"declaration": true,
+		"types": ["node"]
+	},
+	"include": ["src/**/*.ts"],
+	"exclude": ["node_modules"],
+	"typedocOptions": {
+		"entryPoints": ["./src/index.ts"],
+		"out": "docs",
+		"name": "girbind"
+	}
+}

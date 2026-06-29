@@ -1,0 +1,71 @@
+{
+	"name": "girbind",
+	"version": "0.0.1",
+	"description": "Convert GObject Introspection (GIR) files into Node.js addons",
+	"author": "James Prevett <jp@jamespre.dev> (https://jamespre.dev)",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/james-pre/girbind.git"
+	},
+	"funding": {
+		"type": "individual",
+		"url": "https://github.com/sponsors/james-pre"
+	},
+	"homepage": "https://github.com/james-pre/girbind#readme",
+	"bugs": {
+		"url": "https://github.com/james-pre/girbind/issues"
+	},
+	"license": "LGPL-3.0-or-later",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"bin": {
+		"girbind": "dist/cli.js"
+	},
+	"exports": {
+		".": "./dist/index.js",
+		"./*": "./dist/*.js"
+	},
+	"keywords": [
+		"gir",
+		"addon",
+		"native"
+	],
+	"files": [
+		"dist",
+		"templates"
+	],
+	"scripts": {
+		"format:check": "prettier --check .",
+		"format": "prettier --write .",
+		"lint": "tsc --noEmit && eslint src",
+		"test": "echo 'No tests yet'",
+		"build": "tsc",
+		"prepublishOnly": "npm run build"
+	},
+	"devDependencies": {
+		"@commander-js/extra-typings": "^15.0.0",
+		"@eslint/js": "^10.0.1",
+		"@types/node": "^25.5.0",
+		"eslint": "^10.1.0",
+		"globals": "^17.4.0",
+		"prettier": "^3.2.5",
+		"typedoc": "^0.28.19",
+		"typescript": "^6.0.0",
+		"typescript-eslint": "^8.58.0"
+	},
+	"dependencies": {
+		"commander": "^15.0.0",
+		"fast-xml-parser": "^5.9.3",
+		"ioium": "^1.6.0"
+	},
+	"prettier": {
+		"singleQuote": true,
+		"useTabs": true,
+		"trailingComma": "es5",
+		"tabWidth": 4,
+		"printWidth": 120,
+		"arrowParens": "avoid",
+		"experimentalOperatorPosition": "start"
+	}
+}
