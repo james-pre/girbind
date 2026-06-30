@@ -39,7 +39,7 @@
 		"format:check": "prettier --check .",
 		"format": "prettier --write .",
 		"lint": "tsc --noEmit && eslint src",
-		"test": "echo 'No tests yet'",
+		"test": "bash test/flatpak.sh",
 		"build": "tsc",
 		"prepublishOnly": "npm run build"
 	},
@@ -47,7 +47,9 @@
 		"@commander-js/extra-typings": "^15.0.0",
 		"@eslint/js": "^10.0.1",
 		"@types/node": "^25.5.0",
+		"cmake-js": "^8.0.0",
 		"eslint": "^10.1.0",
+		"node-addon-api": "^8.9.0",
 		"globals": "^17.4.0",
 		"prettier": "^3.2.5",
 		"typedoc": "^0.28.19",

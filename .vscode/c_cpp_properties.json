@@ -1,0 +1,18 @@
+{
+	"configurations": [
+		{
+			"name": "Linux",
+			"compilerPath": "/usr/bin/c++",
+			"compileCommands": "${workspaceFolder}/build/compile_commands.json",
+			"includePath": [
+				"${default}",
+				"${workspaceFolder}/node_modules/node-api-headers/include",
+				"${workspaceFolder}/node_modules/node-addon-api"
+			],
+			"defines": [],
+			"cStandard": "c23",
+			"cppStandard": "c++23"
+		}
+	],
+	"version": 4
+}
