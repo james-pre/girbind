@@ -47,9 +47,7 @@
 		"@commander-js/extra-typings": "^15.0.0",
 		"@eslint/js": "^10.0.1",
 		"@types/node": "^25.5.0",
-		"cmake-js": "^8.0.0",
 		"eslint": "^10.1.0",
-		"node-addon-api": "^8.9.0",
 		"globals": "^17.4.0",
 		"prettier": "^3.2.5",
 		"typedoc": "^0.28.19",
@@ -57,9 +55,11 @@
 		"typescript-eslint": "^8.58.0"
 	},
 	"dependencies": {
+		"cmake-js": "^8.0.0",
 		"commander": "^15.0.0",
 		"fast-xml-parser": "^5.9.3",
-		"ioium": "^1.6.0"
+		"ioium": "^1.6.0",
+		"node-addon-api": "^8.9.0"
 	},
 	"binary": {
 		"napi_versions": [
