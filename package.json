@@ -1,6 +1,6 @@
 {
 	"name": "girbind",
-	"version": "0.0.1",
+	"version": "0.1.0",
 	"description": "Convert GObject Introspection (GIR) files into Node.js addons",
 	"author": "James Prevett <jp@jamespre.dev> (https://jamespre.dev)",
 	"repository": {
