@@ -55,6 +55,9 @@ jobs:
             - name: Checkout
               uses: actions/checkout@v5
 
+            - name: Install native dependencies
+              run: dnf install -y cmake gcc-c++ git libatomic make ninja-build python3
+
             - name: Setup npm authentication
               uses: actions/setup-node@v6
               with:
