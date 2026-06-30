@@ -1,0 +1,7 @@
+{
+	"flatpak": {
+		"include": ["flatpak/flatpak.h"],
+		"pkgConfig": ["flatpak"],
+		"gir": "/usr/share/gir-1.0/Flatpak-1.0.gir"
+	}
+}

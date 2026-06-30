@@ -29,7 +29,7 @@ echo "==> Generating bindings -> $out"
 node dist/main.js generate "$gir" -o "$out" -i flatpak/flatpak.h -p flatpak
 
 echo "==> Compiling addon -> $build"
-node dist/main.js build -o "$out" --build-dir "$build"
+node dist/main.js compile -o "$out" --build-dir "$build"
 
 echo "==> Running usage test"
 node test/flatpak.js "$build/flatpak.js"

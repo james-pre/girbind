@@ -13,7 +13,7 @@
  * Parent` holds, and the TS emitter uses real `extends`.
  *
  * The emitter is a set of generator functions: each `yield`s lines of C++ and
- * the top-level {@link generateCxx} joins them. Emitted code is tab-indented.
+ * the top-level {@link generate} joins them. Emitted code is tab-indented.
  */
 
 import type { Class, Func, Namespace, Parameter, Property, ReturnValue, TypeRef } from '../ir.js';
@@ -870,7 +870,7 @@ function* moduleInit(ns: Namespace, moduleName: string): Lines {
 	yield `NODE_API_MODULE(${moduleName}, Init)`;
 }
 
-export interface CxxOptions {
+export interface Options {
 	/**
 	 * Registered module name; must match the built `<name>.node` and the
 	 * require() path in the generated JS. Defaults to the namespace name,
@@ -892,7 +892,7 @@ function includeDirective(inc: string): string {
 	return `#include ${wrapped}`;
 }
 
-function* file(ns: Namespace, options: CxxOptions): Lines {
+function* file(ns: Namespace, options: Options): Lines {
 	const cxx: Cxx = { ctx: new TypeContext(ns), failReturn: 'return env.Null();' };
 	const moduleName = options.moduleName ?? ns.name.toLowerCase();
 
@@ -912,6 +912,6 @@ function* file(ns: Namespace, options: CxxOptions): Lines {
 	yield* moduleInit(ns, moduleName);
 }
 
-export function generateCxx(ns: Namespace, options: CxxOptions = {}): string {
+export function generate(ns: Namespace, options: Options = {}): string {
 	return [...file(ns, options)].join('\n') + '\n';
 }

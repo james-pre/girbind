@@ -61,6 +61,11 @@
 		"fast-xml-parser": "^5.9.3",
 		"ioium": "^1.6.0"
 	},
+	"binary": {
+		"napi_versions": [
+			7
+		]
+	},
 	"prettier": {
 		"singleQuote": true,
 		"useTabs": true,

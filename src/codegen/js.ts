@@ -7,7 +7,7 @@
  * C++ side registers each class independently, so the inheritance relationship
  * is reconstructed here from the IR.
  *
- * Built from generator functions that `yield` lines; {@link generateJs} joins
+ * Built from generator functions that `yield` lines; {@link generate} joins
  * them. Emitted code is tab-indented.
  */
 
@@ -52,6 +52,6 @@ function* file(ns: Namespace, addonPath: string): Lines {
  * point. The build step colocates the addon with the JS, so this is normally
  * `./<addon>.node`.
  */
-export function generateJs(ns: Namespace, addonPath: string): string {
+export function generate(ns: Namespace, addonPath: string): string {
 	return [...file(ns, addonPath)].join('\n') + '\n';
 }

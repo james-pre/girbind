@@ -6,7 +6,7 @@
  * All names come from {@link ../names} so they match the addon's exports exactly.
  *
  * Like the C++ emitter, this is built from generator functions that `yield`
- * lines; {@link generateTs} joins them. Emitted code is tab-indented.
+ * lines; {@link generate} joins them. Emitted code is tab-indented.
  */
 
 import type { Class, Enumeration, Func, Namespace, Property } from '../ir.js';
@@ -107,6 +107,6 @@ function* file(ns: Namespace): Lines {
 	}
 }
 
-export function generateTs(ns: Namespace): string {
+export function generate(ns: Namespace): string {
 	return [...file(ns)].join('\n') + '\n';
 }

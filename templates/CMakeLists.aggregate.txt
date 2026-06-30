@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.15)
+project(@PROJECT_NAME@)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+add_compile_definitions(NAPI_VERSION=10)
+
+add_definitions(
+	-DNODE_ADDON_API_CPP_EXCEPTIONS
+	-DNODE_ADDON_API_CPP_EXCEPTIONS_ALL
+)
+
+# node-addon-api ships napi.h; ask it for its include directory.
+execute_process(
+	COMMAND node -p "require('node-addon-api').include_dir"
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	OUTPUT_VARIABLE NODE_ADDON_API_DIR
+	OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+find_package(PkgConfig REQUIRED)
+
+# Where built .node files are placed. `girbind build` overrides with -D.
+set(GIRBIND_OUTPUT_DIR "@OUTPUT_DIR@" CACHE PATH "Directory for the built .node files")
+
+# One addon target per girbind package. CMake builds these concurrently.
+@TARGETS@
