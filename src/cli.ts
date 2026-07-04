@@ -114,17 +114,17 @@ cli.command('build')
 
 cli.command('compile')
 	.description('Compile a single generated directory (from `generate`) and colocate the JS + types')
-	.requiredOption('-o, --outdir <dir>', 'directory containing the generated sources (from `generate`)')
+	.requiredOption('-d, --directory <dir>', 'directory containing the generated sources (from `generate`)')
 	.option('-m, --module-name <name>', 'addon name (defaults to the single .cc found in outdir)')
-	.option('--build-dir <dir>', 'directory the built .node (and copied js/d.ts) go in', 'build')
-	.action((opts: { outdir: string; moduleName?: string; buildDir: string }) => {
-		const name = opts.moduleName ?? inferModuleName(opts.outdir);
-		mkdirSync(opts.buildDir, { recursive: true });
-		cmakeCompile(opts.outdir, opts.buildDir);
+	.option('-o, --outdir <dir>', 'directory the built .node (and copied js/d.ts) go in', 'build')
+	.action(opts => {
+		const name = opts.moduleName ?? inferModuleName(opts.directory);
+		mkdirSync(opts.outdir, { recursive: true });
+		cmakeCompile(opts.directory, opts.outdir);
 		for (const ext of ['js', 'd.ts']) {
-			copyFileSync(join(opts.outdir, `${name}.${ext}`), join(opts.buildDir, `${name}.${ext}`));
+			copyFileSync(join(opts.directory, `${name}.${ext}`), join(opts.outdir, `${name}.${ext}`));
 		}
-		console.error(`Built ${name}.node into ${opts.buildDir}/`);
+		console.error(`Built ${name}.node into ${opts.outdir}/`);
 	});
 
 /** Run `cmake-js compile` against `directory`, emitting .node files into `outputDir`. */
@@ -137,7 +137,7 @@ function cmakeCompile(directory: string, outputDir: string): void {
 			'--directory',
 			resolve(directory),
 			'--out',
-			resolve(outputDir, '.cmake-build'),
+			resolve(directory, '.cmake-build'),
 			`--CDGIRBIND_OUTPUT_DIR=${resolve(outputDir)}`,
 		],
 		{ stdio: 'inherit' }
