@@ -28,7 +28,7 @@ function memberName(name: string): string {
 
 function* enumDecl(e: Enumeration): Lines {
 	yield `export enum ${e.name} {`;
-	for (const m of e.members) yield `\t${m.name.toUpperCase()} = ${m.value},`;
+	for (const m of e.members) yield `\t${m.name} = ${m.value},`;
 	yield '}';
 	yield '';
 }
