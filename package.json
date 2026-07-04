@@ -20,7 +20,7 @@
 	"main": "dist/index.js",
 	"types": "dist/index.d.ts",
 	"bin": {
-		"girbind": "dist/cli.js"
+		"girbind": "dist/main.js"
 	},
 	"exports": {
 		".": "./dist/index.js",
