@@ -63,26 +63,22 @@ export class Object {
 	 * object. Rejects with the abort reason if `options.signal` aborts first.
 	 */
 	once(signal: string, options: Omit<ConnectOptions, 'after'> = {}): Promise<unknown[]> {
-		return new Promise((resolve, reject) => {
-			if (options.signal?.aborted) {
-				reject(options.signal.reason);
-				return;
-			}
-			const id = this.connect(
-				signal,
-				(_self, ...args: unknown[]) => {
-					this.disconnect(id);
-					options.signal?.removeEventListener('abort', onAbort);
-					resolve(args);
-				},
-				{}
-			);
-			const onAbort = () => {
-				this.disconnect(id);
-				reject(options.signal!.reason);
-			};
-			options.signal?.addEventListener('abort', onAbort, { once: true });
+		const { promise, resolve, reject } = Promise.withResolvers<unknown[]>();
+		if (options.signal?.aborted) {
+			reject(options.signal.reason as Error);
+			return promise;
+		}
+		const onAbort = () => {
+			this.disconnect(id);
+			reject(options.signal!.reason as Error);
+		};
+		const id = this.connect(signal, (_self, ...args: unknown[]) => {
+			this.disconnect(id);
+			options.signal?.removeEventListener('abort', onAbort);
+			resolve(args);
 		});
+		options.signal?.addEventListener('abort', onAbort, { once: true });
+		return promise;
 	}
 }
 

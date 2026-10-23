@@ -171,9 +171,11 @@ void on_poll(uv_handle_t *handle, int status, int events) {
 	watch->fired |= status < 0 ? -1 : events;
 }
 
-void on_timer(uv_handle_t *) {}
+void on_timer(uv_handle_t *) {
+}
 
-void on_keepalive(uv_handle_t *) {}
+void on_keepalive(uv_handle_t *) {
+}
 
 void drain_pending_deletes() {
 	std::vector<napi_ref> deletes;
@@ -256,7 +258,9 @@ void on_check(uv_handle_t *) {
 	for (auto &[fd, watch] : pump->watches)
 		watch.fired = 0;
 
-	if (g_main_context_check(pump->context, pump->max_priority, pump->fds.data(), static_cast<gint>(pump->fds.size()))) {
+	if (g_main_context_check(
+			pump->context, pump->max_priority, pump->fds.data(), static_cast<gint>(pump->fds.size())
+		)) {
 		napi_handle_scope handle_scope;
 		napi_open_handle_scope(pump->env, &handle_scope);
 		napi_value resource;
@@ -358,9 +362,7 @@ void report(napi_env env, napi_value error) {
 	napi_fatal_exception(env, error);
 }
 
-void marshal(
-	GClosure *closure, GValue *return_value, guint count, const GValue *params, gpointer, gpointer
-) {
+void marshal(GClosure *closure, GValue *return_value, guint count, const GValue *params, gpointer, gpointer) {
 	auto *js = reinterpret_cast<JsClosure *>(closure);
 	if (!on_main_thread()) {
 		g_critical("girbind: a signal was emitted on a thread other than the main thread; its JS handler was skipped");
