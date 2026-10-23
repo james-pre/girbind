@@ -1,5 +1,11 @@
 {
 	"editor.defaultFormatter": "esbenp.prettier-vscode",
 	"editor.formatOnSave": true,
-	"cSpell.words": ["girbind", "girepository", "gobject", "introspection"]
+	"cSpell.words": [
+		"girbind",
+		"girepository",
+		"gobject",
+		"introspection"
+	],
+	"cmake.sourceDirectory": "/home/jp/src/girbind/templates"
 }
