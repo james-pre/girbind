@@ -7,4 +7,5 @@ tmp
 !.github
 !.vscode
 !.gitignore
+!.clang-format
 *.tsbuildinfo
