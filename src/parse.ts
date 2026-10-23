@@ -15,12 +15,15 @@ import type {
 	Direction,
 	EnumMember,
 	Enumeration,
+	Field,
 	Func,
 	Include,
 	Namespace,
 	Parameter,
 	Property,
+	Struct,
 	ReturnValue,
+	Signal,
 	Transfer,
 	TypeInfo,
 	TypeRef,
@@ -61,6 +64,8 @@ const ARRAY_ELEMENTS = new Set([
 	'include',
 	'callback',
 	'union',
+	'field',
+	'glib:signal',
 ]);
 
 /** A parsed XML node: attributes (prefixed) plus child element keys. */
@@ -252,6 +257,57 @@ function parseProperty(node: Node): Property | undefined {
 	};
 }
 
+function parseSignal(node: Node): Signal | undefined {
+	const name = attr(node, 'name');
+	if (!name) return undefined;
+	return {
+		name,
+		parameters: children(child(node, 'parameters'), 'parameter').map(p => parseParameter(p, false)),
+		returnValue: parseReturnValue(child(node, 'return-value')),
+	};
+}
+
+function parseField(node: Node): Field | undefined {
+	const name = attr(node, 'name');
+	if (!name) return undefined;
+	return {
+		name,
+		type: parseTypeRef(node),
+		readable: boolAttr(node, 'readable', true),
+		writable: boolAttr(node, 'writable'),
+		hidden: boolAttr(node, 'private') || attr(node, 'bits') !== undefined || !!child(node, 'callback'),
+	};
+}
+
+/** Constructors, methods and static functions shared by classes and records. */
+function parseMembers(node: Node): Pick<Class, 'constructors' | 'methods' | 'staticMethods'> {
+	return {
+		constructors: children(node, CONSTRUCTOR_TAG)
+			.map(c => parseFunction(c, { isConstructor: true }))
+			.filter((f): f is Func => !!f),
+		methods: children(node, 'method')
+			.map(m => parseFunction(m, { isMethod: true }))
+			.filter((f): f is Func => !!f),
+		staticMethods: children(node, 'function')
+			.map(m => parseFunction(m, { isMethod: true, isStatic: true }))
+			.filter((f): f is Func => !!f),
+	};
+}
+
+function parseRecord(node: Node, nsPrefix: string): Struct | undefined {
+	const info = parseTypeInfo(node, nsPrefix);
+	if (!info) return undefined;
+	return {
+		...info,
+		...parseMembers(node),
+		fields: children(node, 'field')
+			.map(parseField)
+			.filter((f): f is Field => !!f),
+		isGTypeStruct: attr(node, 'glib:is-gtype-struct-for') !== undefined,
+		isOpaque: boolAttr(node, 'disguised') || boolAttr(node, 'opaque'),
+	};
+}
+
 function parseTypeInfo(node: Node, nsPrefix: string): TypeInfo | undefined {
 	const name = attr(node, 'name');
 	if (!name) return undefined;
@@ -272,18 +328,13 @@ function parseClass(node: Node, nsPrefix: string, namespace: string): Class | un
 		...info,
 		parent: parent ? qualify(parent, namespace) : undefined,
 		fundamental: boolAttr(node, 'glib:fundamental'),
-		constructors: children(node, CONSTRUCTOR_TAG)
-			.map(c => parseFunction(c, { isConstructor: true }))
-			.filter((f): f is Func => !!f),
-		methods: children(node, 'method')
-			.map(m => parseFunction(m, { isMethod: true }))
-			.filter((f): f is Func => !!f),
-		staticMethods: children(node, 'static-method')
-			.map(m => parseFunction(m, { isMethod: true, isStatic: true }))
-			.filter((f): f is Func => !!f),
+		...parseMembers(node),
 		properties: children(node, 'property')
 			.map(parseProperty)
 			.filter((p): p is Property => !!p),
+		signals: children(node, 'glib:signal')
+			.map(parseSignal)
+			.filter((s): s is Signal => !!s),
 	};
 }
 
@@ -370,7 +421,10 @@ export function parseGir(xml: string): Namespace {
 		symbolPrefixes: splitPrefixes(attr(nsNode, 'c:symbol-prefixes')),
 		classes,
 		interfaces: typeInfos('interface'),
-		records: [...typeInfos('record'), ...typeInfos('union')],
+		records: children(nsNode, 'record')
+			.map(node => parseRecord(node, nsPrefix))
+			.filter((record): record is Struct => !!record),
+		unions: typeInfos('union'),
 		callbacks: children(nsNode, 'callback')
 			.map(node => attr(node, 'name'))
 			.filter((callback): callback is string => !!callback),
@@ -412,19 +466,67 @@ export function loadRepository(girPath: string, parsed?: Namespace): Repository 
 	return repository;
 }
 
+/** Whether a C type names plain data: no pointers, no callbacks. */
+function isPointerFree(cType: string): boolean {
+	return !cType.includes('*') && !['gpointer', 'gconstpointer'].includes(cType.trim());
+}
+
+/** Decide each record's binding, which can depend on records from other namespaces. */
+function bindRecords(repository: Repository, callbacks: Set<string>): void {
+	const records = new Map<string, Struct>();
+	for (const ns of repository.values())
+		for (const record of ns.records) records.set(`${ns.name}.${record.name}`, record);
+
+	const plainData = new Map<Struct, boolean>();
+	const isPlainData = (record: Struct, namespace: string): boolean => {
+		const known = plainData.get(record);
+		if (known !== undefined) return known;
+		plainData.set(record, false);
+		const result =
+			!record.isOpaque
+			&& record.fields.length > 0
+			&& record.fields.every(field => {
+				const typeName = qualify(
+					field.type.isArray ? (field.type.elementType ?? '') : field.type.girType,
+					namespace
+				);
+				if (callbacks.has(typeName) || field.type.girType === 'none') return false;
+				if (field.type.cType && !isPointerFree(field.type.cType)) return false;
+				const nested = records.get(typeName);
+				if (nested) return isPlainData(nested, typeName.slice(0, typeName.lastIndexOf('.')));
+				return !!field.type.cType || field.type.isArray;
+			});
+		plainData.set(record, result);
+		return result;
+	};
+
+	for (const ns of repository.values()) {
+		for (const record of ns.records) {
+			if (record.isGTypeStruct) continue;
+			if (record.getType) record.binding = 'boxed';
+			else if (isPlainData(record, ns.name)) record.binding = 'plain';
+		}
+	}
+}
+
 /** Flag parameters whose handling depends on types from other namespaces in the repository. */
 function annotateParameters(repository: Repository): void {
 	const callbacks = new Set<string>();
-	const records = new Set<string>();
+	const records = new Map<string, Struct>();
 	for (const ns of repository.values()) {
 		for (const callback of ns.callbacks) callbacks.add(`${ns.name}.${callback}`);
-		for (const record of ns.records) records.add(`${ns.name}.${record.name}`);
+		for (const record of ns.records) records.set(`${ns.name}.${record.name}`, record);
 	}
+	bindRecords(repository, callbacks);
 
 	for (const ns of repository.values()) {
 		const functions = [
 			...ns.functions,
-			...ns.classes.flatMap(cls => [...cls.constructors, ...cls.methods, ...cls.staticMethods]),
+			...[...ns.classes, ...ns.records].flatMap(owner => [
+				...owner.constructors,
+				...owner.methods,
+				...owner.staticMethods,
+			]),
 		];
 		for (const func of functions) {
 			if (callbacks.has(qualify(func.returnValue.type.girType, ns.name))) func.returnValue.isCallback = true;
@@ -432,9 +534,10 @@ function annotateParameters(repository: Repository): void {
 		for (const parameter of functions.flatMap(func => func.parameters)) {
 			const qualified = qualify(parameter.type.girType, ns.name);
 			if (callbacks.has(qualified)) parameter.isCallback = true;
-			if (parameter.direction !== 'in' && records.has(qualified) && !/\*\s*\*/.test(parameter.type.cType)) {
-				parameter.isRecordOut = true;
-			}
+			const record = records.get(qualified);
+			if (parameter.direction === 'in' || !record || /\*\s*\*/.test(parameter.type.cType)) continue;
+			if (record.binding && !record.isOpaque && record.fields.length) parameter.fillsRecord = true;
+			else parameter.isRecordOut = true;
 		}
 	}
 }

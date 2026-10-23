@@ -34,7 +34,7 @@ export function isSupported(func: Func): boolean {
 				|| p.isRecordOut
 				|| p.name === '...'
 				|| p.type.cType.includes('va_list')
-				|| (p.direction !== 'in' && p.callerAllocates)
+				|| (p.direction !== 'in' && p.callerAllocates && !p.fillsRecord)
 		)
 		&& !returnsScalarPointer(func)
 		&& !func.returnValue.isCallback

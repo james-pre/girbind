@@ -42,7 +42,7 @@
 		"format:check": "prettier --check .",
 		"format": "prettier --write .",
 		"lint": "tsc --noEmit && tsc --noEmit -p runtime && eslint src runtime/src",
-		"test": "bash test/flatpak.sh",
+		"test": "node test/runtime.js && bash test/flatpak.sh",
 		"build": "tsc && npm run build -w girbind",
 		"prepublishOnly": "npm run build",
 		"build:native": "npm run build:native -w girbind",

@@ -7,7 +7,7 @@
  * (everything else — boxed records, fundamental types, unknown namespaces).
  */
 
-import type { Class, Enumeration, Namespace, TypeInfo, TypeRef } from './ir.js';
+import type { Class, Enumeration, Namespace, RecordBinding, Struct, TypeInfo, TypeRef } from './ir.js';
 import type { Repository } from './parse.js';
 import girToCxx from './types/cxx.json' with { type: 'json' };
 import girToTs from './types/ts.json' with { type: 'json' };
@@ -26,6 +26,15 @@ const runtimeClasses: Record<string, string> = {
 	'GObject.Object': 'GObject',
 	'GObject.InitiallyUnowned': 'GInitiallyUnowned',
 };
+
+/** A record from any loaded namespace that girbind can hold. */
+export interface RecordType {
+	namespace: string;
+	record: Struct;
+	/** Qualified GIR name, e.g. `Graphene.Rect`. */
+	qualified: string;
+	binding: RecordBinding;
+}
 
 /** The nearest ancestor (or the class itself) that exists at runtime. */
 export interface BoundClass {
@@ -54,6 +63,8 @@ export class TypeContext {
 	readonly classes = new Map<string, Class>();
 	readonly enums = new Map<string, Enumeration>();
 	readonly repository: Repository;
+	/** `get_type` functions the generated code calls, which it declares itself. */
+	readonly typeFunctions = new Set<string>();
 
 	/**
 	 * @param modules import specifiers of other bound namespaces, by namespace name
@@ -112,6 +123,22 @@ export class TypeContext {
 		const iface = namespace.interfaces.find(i => i.name === name);
 		if (iface) return { namespace: namespace.name, info: iface, qualified, isInterface: true };
 		return undefined;
+	}
+
+	/** The record named by a GIR type, from any loaded namespace, if girbind can hold it. */
+	recordType(girType: string): RecordType | undefined {
+		if (!girType || !/^[A-Za-z_]/.test(girType) || cxxTable[girType] !== undefined) return undefined;
+		const [namespace, name] = this.split(girType);
+		const record = namespace?.records.find(r => r.name === name);
+		if (!namespace || !record?.binding) return undefined;
+		return { namespace: namespace.name, record, qualified: `${namespace.name}.${name}`, binding: record.binding };
+	}
+
+	/** C++ expression evaluating to the GType a record's handles carry. */
+	recordGType(type: RecordType): string {
+		if (type.binding === 'plain') return `girbind::plain_type("${type.record.cName}")`;
+		this.typeFunctions.add(type.record.getType!);
+		return `${type.record.getType}()`;
 	}
 
 	/** Whether an object type is declared in the namespace being generated. */
@@ -245,6 +272,11 @@ export class TypeContext {
 		}
 		const object = this.objectType(girType);
 		if (object) return object.isInterface ? 'GObject.Object' : this.classReference(object.qualified);
+		const record = this.recordType(girType);
+		if (record) {
+			if (record.namespace === this.ns.name) return record.record.name;
+			return record.namespace in this.modules ? record.qualified : 'GObject.Boxed';
+		}
 		if (girType === 'GLib.Strv') return 'string[]';
 		if (girType === 'GLib.Bytes') return 'Uint8Array';
 		const mapped = tsTable[girType];

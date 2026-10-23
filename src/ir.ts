@@ -42,8 +42,10 @@ export interface Parameter {
 	scope?: string;
 	/** True when the type names a `<callback>` of any loaded namespace, set by `loadRepository`. */
 	isCallback?: boolean;
-	/** True for an out parameter filling a record by value, set by `loadRepository`. */
+	/** True for an out parameter filling a record that cannot be wrapped, set by `loadRepository`. */
 	isRecordOut?: boolean;
+	/** True for an out parameter filling a caller-allocated record that is copied into a wrapper, set by `loadRepository`. */
+	fillsRecord?: boolean;
 }
 
 export interface ReturnValue {
@@ -95,6 +97,41 @@ export interface TypeInfo {
 	getType?: string;
 }
 
+/** A `<glib:signal>`; its parameters exclude the emitting instance. */
+export interface Signal {
+	name: string;
+	parameters: Parameter[];
+	returnValue: ReturnValue;
+}
+
+export interface Field {
+	name: string;
+	type: TypeRef;
+	readable: boolean;
+	writable: boolean;
+	/** True for `private="1"` fields and bit fields, which are never exposed. */
+	hidden: boolean;
+}
+
+/**
+ * How a record is held from JS: `boxed` through its registered boxed GType,
+ * `plain` as a copied plain-old-data struct, or not at all.
+ */
+export type RecordBinding = 'boxed' | 'plain';
+
+export interface Struct extends TypeInfo {
+	fields: Field[];
+	constructors: Func[];
+	methods: Func[];
+	staticMethods: Func[];
+	/** True for class and interface structs (`glib:is-gtype-struct-for`). */
+	isGTypeStruct: boolean;
+	/** True for `disguised` or `opaque` records, whose layout is private. */
+	isOpaque: boolean;
+	/** Set by `loadRepository` once nested record fields can be resolved. */
+	binding?: RecordBinding;
+}
+
 export interface Class extends TypeInfo {
 	/** Qualified parent class name, e.g. `GObject.Object` or `Gtk.Widget`. */
 	parent?: string;
@@ -104,6 +141,7 @@ export interface Class extends TypeInfo {
 	methods: Func[];
 	staticMethods: Func[];
 	properties: Property[];
+	signals: Signal[];
 }
 
 /** A GIR `<enumeration>` or `<bitfield>` and its members. */
@@ -139,7 +177,8 @@ export interface Namespace {
 	symbolPrefixes: string[];
 	classes: Class[];
 	interfaces: TypeInfo[];
-	records: TypeInfo[];
+	records: Struct[];
+	unions: TypeInfo[];
 	/** Names of `<callback>` types. */
 	callbacks: string[];
 	functions: Func[];

@@ -13,6 +13,16 @@ export interface Native {
 	watchFinalization(handle: Handle): void;
 	/** Number of watched objects finalized so far. */
 	finalized(): number;
+	/** Store the runtime ABI so the runtime's own native code can wrap values. */
+	$init(abi: object): void;
+	/** Keep the event loop alive until a matching {@link Native.releaseLoop}. */
+	holdLoop(): void;
+	releaseLoop(): void;
+	/** Connect a JS handler to a GObject signal, returning the handler ID. */
+	connect(handle: Handle, signal: string, handler: (...args: never[]) => unknown, after: boolean): number;
+	disconnect(handle: Handle, id: number): void;
+	/** Call `callback` once from a GLib timeout source after `delay` milliseconds. */
+	timeout(delay: number, callback: () => void): void;
 }
 
 const require = createRequire(import.meta.url);
