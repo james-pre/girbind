@@ -45,7 +45,8 @@
 		"test": "bash test/flatpak.sh",
 		"build": "tsc && npm run build -w girbind",
 		"prepublishOnly": "npm run build",
-		"build:native": "npm run build:native -w girbind"
+		"build:native": "npm run build:native -w girbind",
+		"version": "npm pkg set \"peerDependencies.girbind=^$npm_package_version\" && npm version \"$npm_package_version\" --workspace girbind --no-git-tag-version --allow-same-version && git add package.json package-lock.json runtime/package.json"
 	},
 	"devDependencies": {
 		"@commander-js/extra-typings": "^15.0.0",
