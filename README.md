@@ -4,13 +4,22 @@ Convert GObject Introspection (GIR) files into Node.js addons.
 
 girbind reads a `.gir` file and emits a statically-typed Node.js binding: a C++
 N-API addon, TypeScript declarations (`.d.ts`), and an ESM entry point that loads
-the compiled addon. GObject classes become real JS classes (with inheritance and
-`instanceof`), methods and properties are exposed, and `GError`s are thrown.
+the compiled addon. GObject classes become real JS classes with a normal
+prototype chain, including across namespaces (`Adw.ApplicationWindow` extends
+`Gtk.ApplicationWindow`, which extends `Gtk.Window`), methods and properties are
+exposed, and `GError`s are thrown.
 
 ## Installation
 
+girbind is two packages:
+
+- `girbind` is the runtime that every generated binding loads. It ships a
+  prebuilt native addon and the C++ header generated addons compile against.
+- `girbind-devel` is the code generator and the `girbind` CLI.
+
 ```sh
 npm install girbind
+npm install --save-dev girbind-devel
 ```
 
 Building an addon also needs a C++ toolchain (CMake + a C++23 compiler), the
@@ -63,7 +72,9 @@ them). For a library girbind doesn't ship a config for, add an entry to
 }
 ```
 
-`npx girbind build` then generates any missing sources and builds everything.
+`npx girbind build` then regenerates the sources and builds everything. Bindings
+that depend on each other (for example `gtk` on `gdk` and `gio`) import each
+other, so objects pass between them.
 
 ### 2. Author: publish a bindings package
 
@@ -77,13 +88,13 @@ npx girbind generate /usr/share/gir-1.0/Flatpak-1.0.gir \
 npx girbind compile -o src --build-dir build
 ```
 
-| Option                       | Meaning                                                           |
-| ---------------------------- | ----------------------------------------------------------------- |
-| `-o, --outdir <dir>`         | where to write the generated `.cc`/`.js`/`.d.ts`/`CMakeLists.txt` |
-| `-m, --module-name <name>`   | addon name (defaults to the GIR namespace, lowercased)            |
-| `-i, --include <header…>`    | extra C++ `#include`s for the target library                      |
-| `-p, --pkg-config <module…>` | `pkg-config` modules to link                                      |
-| `--build-dir <dir>`          | where `compile` places the built `.node`                          |
+| Option                       | Meaning                                                            |
+| ---------------------------- | ------------------------------------------------------------------ |
+| `-o, --outdir <dir>`         | where to write the generated `.cxx`/`.js`/`.d.ts`/`CMakeLists.txt` |
+| `-m, --module-name <name>`   | addon name (defaults to the GIR namespace, lowercased)             |
+| `-i, --include <header…>`    | extra C++ `#include`s for the target library                       |
+| `-p, --pkg-config <module…>` | `pkg-config` modules to link                                       |
+| `--build-dir <dir>`          | where `compile` places the built `.node`                           |
 
 Run `npx girbind --help` (or `<command> --help`) for the full set of options.
 

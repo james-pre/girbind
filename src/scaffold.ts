@@ -14,7 +14,7 @@ const templatesDir = join(import.meta.dirname, '..', 'templates');
 export interface CMakeOptions {
 	/** CMake project / addon target name (becomes `<name>.node`). */
 	projectName: string;
-	/** Directory containing the generated `.cc` source(s), relative to the CMake root. */
+	/** Directory containing the generated `.cxx` source(s), relative to the CMake root. */
 	srcDir: string;
 	/** Directory the built `.node` is written to, relative to the CMake root. */
 	outputDir: string;
@@ -57,7 +57,7 @@ export function writeCMakeLists(opts: WriteCmakeOptions) {
 export interface CMakeTarget {
 	/** Addon name; the output is `<name>.node`. */
 	name: string;
-	/** Directory holding this addon's `.cc`, relative to the CMake root. */
+	/** Directory holding this addon's `.cxx`, relative to the CMake root. */
 	srcDir: string;
 	/** pkg-config modules to require for this addon. */
 	pkgConfigModules: string[];
@@ -79,7 +79,7 @@ function targetBlock(target: CMakeTarget): string {
 	const deps = `${target.name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_DEPS`;
 	return [
 		`pkg_check_modules(${deps} REQUIRED ${target.pkgConfigModules.join(' ')})`,
-		`file(GLOB ${target.name}_SRC "${target.srcDir}/*.cc")`,
+		`file(GLOB ${target.name}_SRC "${target.srcDir}/*.cxx")`,
 		`add_library(${target.name}_addon SHARED \${${target.name}_SRC} \${CMAKE_JS_SRC})`,
 		`set_target_properties(${target.name}_addon PROPERTIES`,
 		`\tOUTPUT_NAME "${target.name}"`,
@@ -88,7 +88,7 @@ function targetBlock(target: CMakeTarget): string {
 		'\tLIBRARY_OUTPUT_DIRECTORY "${GIRBIND_OUTPUT_DIR}"',
 		'\tRUNTIME_OUTPUT_DIRECTORY "${GIRBIND_OUTPUT_DIR}"',
 		')',
-		`target_include_directories(${target.name}_addon PRIVATE \${CMAKE_JS_INC} \${NODE_ADDON_API_DIR} \${${deps}_INCLUDE_DIRS})`,
+		`target_include_directories(${target.name}_addon PRIVATE \${CMAKE_JS_INC} \${NODE_ADDON_API_DIR} \${GIRBIND_INCLUDE_DIR} \${${deps}_INCLUDE_DIRS})`,
 		`target_link_libraries(${target.name}_addon PRIVATE \${CMAKE_JS_LIB} \${${deps}_LIBRARIES})`,
 		`target_compile_features(${target.name}_addon PRIVATE cxx_std_23)`,
 	].join('\n');

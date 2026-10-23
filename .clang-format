@@ -10,8 +10,8 @@ BreakBeforeBraces: Attach
 SpaceBeforeParens: ControlStatements
 MaxEmptyLinesToKeep: 1
 KeepEmptyLines:
-  AtStartOfBlock: false
-  AtStartOfFile: false
+    AtStartOfBlock: false
+    AtStartOfFile: false
 
 AlignAfterOpenBracket: BlockIndent
 BinPackArguments: false

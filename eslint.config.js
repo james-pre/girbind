@@ -6,7 +6,7 @@ import tseslint from 'typescript-eslint';
 export default defineConfig({
 	name: 'girbind',
 	extends: [eslint.configs.recommended, ...tseslint.configs.recommendedTypeChecked],
-	files: ['src/**/*.ts'],
+	files: ['src/**/*.ts', 'runtime/src/**/*.ts'],
 	languageOptions: {
 		globals: { ...globals.browser, ...globals.node },
 		ecmaVersion: 'latest',

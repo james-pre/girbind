@@ -48,15 +48,23 @@ jobs:
     release:
         runs-on: ubuntu-latest
         needs: ci
-        container: fedora:44
+        container: debian:stable
         permissions:
             id-token: write
+        defaults:
+            run:
+                shell: bash
         steps:
+            - name: Install native dependencies
+              run: |
+                  dpkg --add-architecture arm64
+                  apt-get update
+                  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                      ca-certificates cmake g++ g++-aarch64-linux-gnu libglib2.0-dev libglib2.0-dev:arm64 \
+                      make ninja-build pkg-config xz-utils
+
             - name: Checkout
               uses: actions/checkout@v5
-
-            - name: Install native dependencies
-              run: dnf install -y cmake gcc-c++ git libatomic make ninja-build python3
 
             - name: Setup npm authentication
               uses: actions/setup-node@v6
@@ -65,10 +73,31 @@ jobs:
                   registry-url: https://registry.npmjs.org/
 
             - name: Install dependencies
-              run: npm install
+              run: npm ci
 
             - name: Build
-              run: npx tsc
+              run: npm run build
 
-            - name: Publish
+            - name: Build runtime for linux-x64
+              run: npx cmake-js compile --directory runtime --out runtime/build/x64 --CDGIRBIND_OUTPUT_NAME=girbind.linux-x64
+
+            - name: Cross-compile runtime for linux-arm64
+              env:
+                  PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+              run: >
+                  npx cmake-js compile --directory runtime --out runtime/build/arm64
+                  --CDGIRBIND_OUTPUT_NAME=girbind.linux-arm64
+                  --CDCMAKE_SYSTEM_NAME=Linux --CDCMAKE_SYSTEM_PROCESSOR=aarch64
+                  --CDCMAKE_C_COMPILER=aarch64-linux-gnu-gcc --CDCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+
+            - name: Check runtime binaries
+              run: |
+                  readelf -h runtime/dist/girbind.linux-x64.node | grep -q 'X86-64'
+                  readelf -h runtime/dist/girbind.linux-arm64.node | grep -q 'AArch64'
+                  sha256sum runtime/dist/*.node
+
+            - name: Publish girbind
+              run: npm publish --workspace girbind --access=public --provenance
+
+            - name: Publish girbind-devel
               run: npm publish --access=public --provenance

@@ -15,6 +15,8 @@ export interface LibraryConfig {
 	gir: string;
 	include: string[];
 	pkgConfig: string[];
+	/** Preprocessor macros to define before the includes, e.g. `G_SETTINGS_ENABLE_BACKEND`. */
+	defines?: string[];
 }
 
 /** A built-in config plus its name (the configs.json key). */
@@ -58,7 +60,13 @@ export function resolveDep(entry: DepEntry): ResolvedDep {
 		return { name: entry, ...config };
 	}
 	if (!entry.name) throw new Error('girbindDependencies object entry is missing a "name"');
-	return { name: entry.name, gir: entry.gir, include: entry.include, pkgConfig: entry.pkgConfig };
+	return {
+		name: entry.name,
+		gir: entry.gir,
+		include: entry.include,
+		pkgConfig: entry.pkgConfig,
+		defines: entry.defines,
+	};
 }
 
 interface PackageJson {

@@ -18,6 +18,14 @@ execute_process(
 	OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
+# The girbind runtime package ships girbind.hxx, the ABI shared with the runtime addon.
+execute_process(
+	COMMAND node --import node:path -p "path.join(path.dirname(require.resolve('girbind/package.json')), 'include')"
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	OUTPUT_VARIABLE GIRBIND_INCLUDE_DIR
+	OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
 find_package(PkgConfig REQUIRED)
 # @PKGCONFIG_MODULES@ is filled in by girbind from girbindDependencies
 pkg_check_modules(GIRBIND_DEPS REQUIRED @PKGCONFIG_MODULES@)
@@ -26,7 +34,7 @@ pkg_check_modules(GIRBIND_DEPS REQUIRED @PKGCONFIG_MODULES@)
 # time; `girbind build` overrides it with -DGIRBIND_OUTPUT_DIR=<dir>.
 set(GIRBIND_OUTPUT_DIR "@OUTPUT_DIR@" CACHE PATH "Directory for the built .node")
 
-file(GLOB SRC "@SRC_DIR@/*.cc")
+file(GLOB SRC "@SRC_DIR@/*.cxx")
 
 # The target is named distinctly from the addon (OUTPUT_NAME) so it never
 # collides with a linked library of the same name (e.g. linking `flatpak` from
@@ -40,7 +48,7 @@ set_target_properties(${ADDON_TARGET} PROPERTIES
 	LIBRARY_OUTPUT_DIRECTORY "${GIRBIND_OUTPUT_DIR}"
 	RUNTIME_OUTPUT_DIRECTORY "${GIRBIND_OUTPUT_DIR}"
 )
-target_include_directories(${ADDON_TARGET} PRIVATE ${CMAKE_JS_INC} ${NODE_ADDON_API_DIR})
+target_include_directories(${ADDON_TARGET} PRIVATE ${CMAKE_JS_INC} ${NODE_ADDON_API_DIR} ${GIRBIND_INCLUDE_DIR})
 target_include_directories(${ADDON_TARGET} PRIVATE ${GIRBIND_DEPS_INCLUDE_DIRS})
 target_link_libraries(${ADDON_TARGET} PRIVATE ${CMAKE_JS_LIB} ${GIRBIND_DEPS_LIBRARIES})
 target_compile_features(${ADDON_TARGET} PRIVATE cxx_std_23)

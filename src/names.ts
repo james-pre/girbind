@@ -8,15 +8,42 @@
  */
 
 import type { Func, Namespace } from './ir.js';
+import girToCxx from './types/cxx.json' with { type: 'json' };
+
+const cxxTable: Record<string, string> = girToCxx;
+
+/** A scalar return value that C actually returns through a pointer, i.e. an unannotated C array. */
+function returnsScalarPointer(func: Func): boolean {
+	const { type } = func.returnValue;
+	const scalar = cxxTable[type.girType];
+	return !type.isArray && !!scalar && !scalar.includes('*') && type.cType.includes('*');
+}
 
 /**
- * Whether girbind can currently emit a binding for a function. Functions taking
- * a callback (a parameter with a GIR `scope`) are skipped for now — wrapping
- * GObject callbacks across the JS boundary is not yet implemented. Used by every
- * emitter so the JS/TS/C++ exported sets stay identical.
+ * Whether girbind can currently emit a binding for a function. Skipped for now:
+ * callbacks (a parameter with a GIR `scope`), varargs and `va_list`, and
+ * caller-allocated out parameters. Used by every emitter so the JS/TS/C++
+ * exported sets stay identical.
  */
 export function isSupported(func: Func): boolean {
-	return !func.parameters.some(p => p.scope !== undefined);
+	return (
+		!func.parameters.some(
+			p =>
+				p.scope !== undefined
+				|| p.isCallback
+				|| p.isRecordOut
+				|| p.name === '...'
+				|| p.type.cType.includes('va_list')
+				|| (p.direction !== 'in' && p.callerAllocates)
+		)
+		&& !returnsScalarPointer(func)
+		&& !func.returnValue.isCallback
+	);
+}
+
+/** An object key or enum member name, quoted unless it is a valid identifier. */
+export function propertyKey(name: string): string {
+	return /^[A-Za-z_$][\w$]*$/.test(name) ? name : `'${name}'`;
 }
 
 /** Convert a snake_case / hyphenated GIR name to camelCase. */

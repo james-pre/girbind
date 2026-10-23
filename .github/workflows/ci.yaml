@@ -21,7 +21,7 @@ jobs:
               uses: actions/checkout@v5
 
             - name: Install native dependencies
-              run: dnf install -y cmake gcc-c++ git libatomic make ninja-build python3
+              run: dnf install -y cmake flatpak-devel gcc-c++ git glib2-devel libatomic make ninja-build pkgconf-pkg-config python3
 
             - name: Set up Node.js
               uses: actions/setup-node@v6
@@ -39,6 +39,9 @@ jobs:
 
             - name: Build
               run: npm run build
+
+            - name: Build runtime
+              run: npm run build:native
 
             - name: Test
               run: npm test

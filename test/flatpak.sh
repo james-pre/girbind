@@ -32,6 +32,6 @@ echo "==> Compiling addon -> $build"
 node dist/main.js compile -d "$out" -o "$build"
 
 echo "==> Running usage test"
-node test/flatpak.js "$build/flatpak.js"
+node --expose-gc test/flatpak.js "$build/flatpak.js"
 
 echo "PASS"

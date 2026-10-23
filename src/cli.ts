@@ -1,10 +1,10 @@
 import { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import $pkg from '../package.json' with { type: 'json' };
-import { generatePackage } from './codegen/index.js';
-import { builtinNames, depName, readPackageJson, resolveDep, writePackageJson } from './deps.js';
+import { generatePackage, siblingModules } from './codegen/index.js';
+import { builtinNames, type DepEntry, depName, readPackageJson, resolveDep, writePackageJson } from './deps.js';
 import { parseGirFile } from './parse.js';
 import { GIRBIND_DIR, writeAggregateCMake, writeCMakeLists } from './scaffold.js';
 
@@ -18,11 +18,23 @@ cli.command('generate')
 	.option('-i, --include <header...>', "additional C++ #include(s), e.g. 'flatpak/flatpak.h'", [])
 	.option('-p, --pkg-config <module...>', "pkg-config module(s) to link, e.g. 'flatpak'", [])
 	.option('--build-dir <dir>', 'directory the built .node will be placed in by `build`', 'build')
+	.option(
+		'--import <namespace=specifier...>',
+		"import specifier of another bound namespace, e.g. 'Gio=gio-bindings'",
+		[]
+	)
 	.action((gir: string, opts) => {
 		const parsed = parseGirFile(gir);
-		const dep = { name: parsed.name.toLowerCase(), ...opts, gir };
+		const dep = { name: opts.name ?? parsed.name.toLowerCase(), ...opts, gir };
+		const modules = Object.fromEntries(
+			opts.import.map(entry => {
+				const [namespace, specifier] = entry.split('=');
+				if (!namespace || !specifier) throw new Error(`Expected <namespace>=<specifier>, got "${entry}"`);
+				return [namespace, specifier];
+			})
+		);
 
-		generatePackage(dep, opts.outdir, parsed);
+		generatePackage(dep, opts.outdir, parsed, modules);
 		writeCMakeLists(dep);
 
 		console.error(`Generated bindings for ${parsed.name}-${parsed.version} into ${opts.outdir}/`);
@@ -40,7 +52,6 @@ cli.command('add')
 
 		for (const name of packages) {
 			const dep = resolveDep(name); // validates against built-in configs
-			generatePackage(dep, join(opts.root, GIRBIND_DIR, dep.name));
 			if (!have.has(dep.name)) {
 				deps.push(name);
 				have.add(dep.name);
@@ -50,7 +61,7 @@ cli.command('add')
 
 		pkg.girbindDependencies = deps;
 		writePackageJson(pkgPath, pkg);
-		writeAggregateCMake(opts.root, deps);
+		generateAll(opts.root, deps);
 	});
 
 cli.command('remove')
@@ -71,7 +82,7 @@ cli.command('remove')
 
 		pkg.girbindDependencies = remaining;
 		writePackageJson(pkgPath, pkg);
-		writeAggregateCMake(opts.root, remaining);
+		generateAll(opts.root, remaining);
 	});
 
 cli.command('build')
@@ -87,14 +98,7 @@ cli.command('build')
 		}
 
 		const girbindRoot = join(opts.root, GIRBIND_DIR);
-		// Ensure sources and the aggregate CMakeLists exist (regenerate if missing).
-		for (const entry of deps) {
-			const dep = resolveDep(entry);
-			if (!existsSync(join(girbindRoot, dep.name, `${dep.name}.cc`))) {
-				generatePackage(dep, join(girbindRoot, dep.name));
-			}
-		}
-		writeAggregateCMake(opts.root, deps);
+		generateAll(opts.root, deps);
 
 		const buildDir = join(opts.root, opts.buildDir);
 		mkdirSync(buildDir, { recursive: true });
@@ -115,7 +119,7 @@ cli.command('build')
 cli.command('compile')
 	.description('Compile a single generated directory (from `generate`) and colocate the JS + types')
 	.requiredOption('-d, --directory <dir>', 'directory containing the generated sources (from `generate`)')
-	.option('-m, --module-name <name>', 'addon name (defaults to the single .cc found in outdir)')
+	.option('-m, --module-name <name>', 'addon name (defaults to the single .cxx found in outdir)')
 	.option('-o, --outdir <dir>', 'directory the built .node (and copied js/d.ts) go in', 'build')
 	.action(opts => {
 		const name = opts.moduleName ?? inferModuleName(opts.directory);
@@ -126,6 +130,19 @@ cli.command('compile')
 		}
 		console.error(`Built ${name}.node into ${opts.outdir}/`);
 	});
+
+/**
+ * Regenerate every dependency's sources (only rewriting changed files) and the
+ * aggregate CMakeLists, so cross-namespace imports reflect the current set.
+ */
+function generateAll(root: string, entries: DepEntry[]): void {
+	const deps = entries.map(resolveDep);
+	const { namespaces, modules } = siblingModules(deps);
+	for (const dep of deps) {
+		generatePackage(dep, join(root, GIRBIND_DIR, dep.name), namespaces.get(dep), modules);
+	}
+	writeAggregateCMake(root, entries);
+}
 
 /** Run `cmake-js compile` against `directory`, emitting .node files into `outputDir`. */
 function cmakeCompile(directory: string, outputDir: string): void {
@@ -149,15 +166,15 @@ function cmakeCompile(directory: string, outputDir: string): void {
 	}
 }
 
-/** Infer the addon name from the single `<name>.cc` in a directory. */
+/** Infer the addon name from the single `<name>.cxx` in a directory. */
 function inferModuleName(outdir: string): string {
-	const sources = readdirSync(outdir).filter(f => f.endsWith('.cc'));
+	const sources = readdirSync(outdir).filter(f => f.endsWith('.cxx'));
 	if (sources.length !== 1) {
 		throw new Error(
-			`Expected exactly one .cc in ${outdir} to infer the module name (found ${sources.length}); pass --module-name`
+			`Expected exactly one .cxx in ${outdir} to infer the module name (found ${sources.length}); pass --module-name`
 		);
 	}
-	return sources[0].replace(/\.cc$/, '');
+	return sources[0].replace(/\.cxx$/, '');
 }
 
 export default cli;

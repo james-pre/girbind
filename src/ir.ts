@@ -40,12 +40,18 @@ export interface Parameter {
 	callerAllocates: boolean;
 	/** GIR `scope` attribute, present on callback parameters (`call`/`async`/`notified`). */
 	scope?: string;
+	/** True when the type names a `<callback>` of any loaded namespace, set by `loadRepository`. */
+	isCallback?: boolean;
+	/** True for an out parameter filling a record by value, set by `loadRepository`. */
+	isRecordOut?: boolean;
 }
 
 export interface ReturnValue {
 	type: TypeRef;
 	transfer: Transfer;
 	nullable: boolean;
+	/** True when the type names a `<callback>` of any loaded namespace, set by `loadRepository`. */
+	isCallback?: boolean;
 }
 
 export interface Func {
@@ -78,12 +84,22 @@ export interface Property {
 	setter?: string;
 }
 
-export interface Class {
+/** A registered type: its GIR name, C type and GType identity. */
+export interface TypeInfo {
 	name: string;
 	/** C type from `c:type`, e.g. `FlatpakRemote`. */
 	cName: string;
-	/** Parent class short name (namespace prefix stripped), or undefined. */
+	/** Registered GType name from `glib:type-name`, e.g. `FlatpakRemote`. */
+	typeName?: string;
+	/** C function returning the GType, from `glib:get-type`. */
+	getType?: string;
+}
+
+export interface Class extends TypeInfo {
+	/** Qualified parent class name, e.g. `GObject.Object` or `Gtk.Widget`. */
 	parent?: string;
+	/** True for `glib:fundamental="1"` classes, which are not GObjects. */
+	fundamental: boolean;
 	constructors: Func[];
 	methods: Func[];
 	staticMethods: Func[];
@@ -105,9 +121,16 @@ export interface EnumMember {
 	value: string;
 }
 
+export interface Include {
+	name: string;
+	version: string;
+}
+
 export interface Namespace {
 	name: string;
 	version: string;
+	/** Namespaces this one depends on, from `<include>`. */
+	includes: Include[];
 	/** Shared library names from the `shared-library` attribute. */
 	sharedLibraries: string[];
 	/** C identifier prefixes, e.g. `Act`, `Flatpak`. */
@@ -115,6 +138,10 @@ export interface Namespace {
 	/** C symbol prefixes, e.g. `flatpak`. */
 	symbolPrefixes: string[];
 	classes: Class[];
+	interfaces: TypeInfo[];
+	records: TypeInfo[];
+	/** Names of `<callback>` types. */
+	callbacks: string[];
 	functions: Func[];
 	enumerations: Enumeration[];
 }

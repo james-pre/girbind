@@ -7,7 +7,8 @@
  * the bindings target.
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { XMLParser } from 'fast-xml-parser';
 import type {
 	Class,
@@ -15,11 +16,13 @@ import type {
 	EnumMember,
 	Enumeration,
 	Func,
+	Include,
 	Namespace,
 	Parameter,
 	Property,
 	ReturnValue,
 	Transfer,
+	TypeInfo,
 	TypeRef,
 } from './ir.js';
 
@@ -56,6 +59,8 @@ const ARRAY_ELEMENTS = new Set([
 	'implements',
 	'prerequisite',
 	'include',
+	'callback',
+	'union',
 ]);
 
 /** A parsed XML node: attributes (prefixed) plus child element keys. */
@@ -86,10 +91,9 @@ function child(node: Node | undefined, key: string): Node | undefined {
 	return children(node, key)[0];
 }
 
-/** Strip a namespace prefix from a qualified name (`Flatpak.Ref` → `Ref`). */
-function stripNamespace(name: string): string {
-	const dot = name.lastIndexOf('.');
-	return dot === -1 ? name : name.slice(dot + 1);
+/** Prefix an unqualified GIR name with its namespace (`Ref` → `Flatpak.Ref`). */
+function qualify(name: string, namespace: string): string {
+	return name.includes('.') ? name : `${namespace}.${name}`;
 }
 
 function splitPrefixes(value: string | undefined): string[] {
@@ -248,15 +252,26 @@ function parseProperty(node: Node): Property | undefined {
 	};
 }
 
-function parseClass(node: Node, nsPrefix: string): Class | undefined {
+function parseTypeInfo(node: Node, nsPrefix: string): TypeInfo | undefined {
 	const name = attr(node, 'name');
 	if (!name) return undefined;
-
-	const parent = attr(node, 'parent');
 	return {
 		name,
 		cName: attr(node, 'c:type') ?? nsPrefix + name,
-		parent: parent ? stripNamespace(parent) : undefined,
+		typeName: attr(node, 'glib:type-name'),
+		getType: attr(node, 'glib:get-type'),
+	};
+}
+
+function parseClass(node: Node, nsPrefix: string, namespace: string): Class | undefined {
+	const info = parseTypeInfo(node, nsPrefix);
+	if (!info) return undefined;
+
+	const parent = attr(node, 'parent');
+	return {
+		...info,
+		parent: parent ? qualify(parent, namespace) : undefined,
+		fundamental: boolAttr(node, 'glib:fundamental'),
 		constructors: children(node, CONSTRUCTOR_TAG)
 			.map(c => parseFunction(c, { isConstructor: true }))
 			.filter((f): f is Func => !!f),
@@ -311,9 +326,14 @@ export function parseGir(xml: string): Namespace {
 
 	const classes: Class[] = [];
 	for (const c of children(nsNode, 'class')) {
-		const cls = parseClass(c, nsPrefix);
+		const cls = parseClass(c, nsPrefix, name);
 		if (cls) classes.push(cls);
 	}
+
+	const typeInfos = (key: string) =>
+		children(nsNode, key)
+			.map(node => parseTypeInfo(node, nsPrefix))
+			.filter((info): info is TypeInfo => !!info);
 
 	// Standalone functions; dedup by C symbol (GIR repeats some).
 	const functions: Func[] = [];
@@ -336,13 +356,24 @@ export function parseGir(xml: string): Namespace {
 		if (parsed) enumerations.push(parsed);
 	}
 
+	const includes: Include[] = children(repository, 'include').map(node => ({
+		name: attr(node, 'name') ?? '',
+		version: attr(node, 'version') ?? '',
+	}));
+
 	return {
 		name,
 		version: attr(nsNode, 'version') ?? '',
+		includes,
 		sharedLibraries: splitPrefixes(attr(nsNode, 'shared-library')),
 		identifierPrefixes,
 		symbolPrefixes: splitPrefixes(attr(nsNode, 'c:symbol-prefixes')),
 		classes,
+		interfaces: typeInfos('interface'),
+		records: [...typeInfos('record'), ...typeInfos('union')],
+		callbacks: children(nsNode, 'callback')
+			.map(node => attr(node, 'name'))
+			.filter((callback): callback is string => !!callback),
 		functions,
 		enumerations,
 	};
@@ -351,4 +382,59 @@ export function parseGir(xml: string): Namespace {
 /** Read and parse a `.gir` file from disk. */
 export function parseGirFile(path: string): Namespace {
 	return parseGir(readFileSync(path, 'utf8'));
+}
+
+/** Parsed namespaces by name: a GIR file plus everything it transitively includes. */
+export type Repository = Map<string, Namespace>;
+
+function girSearchPath(girPath: string): string[] {
+	const dataDirs = (process.env.XDG_DATA_DIRS || '/usr/local/share:/usr/share').split(':').filter(Boolean);
+	return [dirname(girPath), ...dataDirs.map(dir => join(dir, 'gir-1.0'))];
+}
+
+/** Parse a GIR file and the GIRs it includes, skipping includes that cannot be found. */
+export function loadRepository(girPath: string, parsed?: Namespace): Repository {
+	const main = parsed ?? parseGirFile(girPath);
+	const repository: Repository = new Map([[main.name, main]]);
+	const searchPath = girSearchPath(girPath);
+	const pending = [...main.includes];
+
+	for (let include = pending.pop(); include; include = pending.pop()) {
+		if (repository.has(include.name)) continue;
+		const file = `${include.name}-${include.version}.gir`;
+		const path = searchPath.map(dir => join(dir, file)).find(candidate => existsSync(candidate));
+		if (!path) continue;
+		const ns = parseGirFile(path);
+		repository.set(ns.name, ns);
+		pending.push(...ns.includes);
+	}
+	annotateParameters(repository);
+	return repository;
+}
+
+/** Flag parameters whose handling depends on types from other namespaces in the repository. */
+function annotateParameters(repository: Repository): void {
+	const callbacks = new Set<string>();
+	const records = new Set<string>();
+	for (const ns of repository.values()) {
+		for (const callback of ns.callbacks) callbacks.add(`${ns.name}.${callback}`);
+		for (const record of ns.records) records.add(`${ns.name}.${record.name}`);
+	}
+
+	for (const ns of repository.values()) {
+		const functions = [
+			...ns.functions,
+			...ns.classes.flatMap(cls => [...cls.constructors, ...cls.methods, ...cls.staticMethods]),
+		];
+		for (const func of functions) {
+			if (callbacks.has(qualify(func.returnValue.type.girType, ns.name))) func.returnValue.isCallback = true;
+		}
+		for (const parameter of functions.flatMap(func => func.parameters)) {
+			const qualified = qualify(parameter.type.girType, ns.name);
+			if (callbacks.has(qualified)) parameter.isCallback = true;
+			if (parameter.direction !== 'in' && records.has(qualified) && !/\*\s*\*/.test(parameter.type.cType)) {
+				parameter.isRecordOut = true;
+			}
+		}
+	}
 }

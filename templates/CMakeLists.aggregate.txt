@@ -18,6 +18,13 @@ execute_process(
 	OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
+execute_process(
+	COMMAND node --import node:path -p "path.join(path.dirname(require.resolve('girbind/package.json')), 'include')"
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	OUTPUT_VARIABLE GIRBIND_INCLUDE_DIR
+	OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
 find_package(PkgConfig REQUIRED)
 
 # Where built .node files are placed. `girbind build` overrides with -D.
