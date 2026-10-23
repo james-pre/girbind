@@ -1,6 +1,6 @@
 {
 	"name": "girbind-devel",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Generate Node.js bindings from GObject Introspection (GIR) files",
 	"author": "James Prevett <jp@jamespre.dev> (https://jamespre.dev)",
 	"repository": {
@@ -81,6 +81,6 @@
 		"experimentalOperatorPosition": "start"
 	},
 	"peerDependencies": {
-		"girbind": "^0.2.0"
+		"girbind": "^0.3.0"
 	}
 }
