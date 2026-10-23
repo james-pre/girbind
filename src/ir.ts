@@ -46,6 +46,8 @@ export interface Parameter {
 	isRecordOut?: boolean;
 	/** True for an out parameter filling a caller-allocated record that is copied into a wrapper, set by `loadRepository`. */
 	fillsRecord?: boolean;
+	/** True for an inout parameter that is not a number, boolean or enum, set by `loadRepository`. */
+	isComplexInout?: boolean;
 }
 
 export interface ReturnValue {
@@ -147,6 +149,12 @@ export interface Class extends TypeInfo {
 }
 
 export interface Interface extends TypeInfo {
+	/** Qualified names of the classes and interfaces an implementation must also be. */
+	prerequisites: string[];
+	constructors: Func[];
+	methods: Func[];
+	staticMethods: Func[];
+	properties: Property[];
 	signals: Signal[];
 }
 

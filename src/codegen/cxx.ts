@@ -3,7 +3,9 @@
  *
  * Each addon defines its classes natively in `$init`: GObject classes extend
  * their GIR parent (looked up in the runtime when it lives in another
- * namespace), and records extend the runtime's `GObject.Boxed`. Instance
+ * namespace), and records extend the runtime's `GObject.Boxed`. Interfaces are
+ * standalone objects whose instance members the runtime adds to the prototype
+ * of every class implementing them. Instance
  * members read `self` from `this` through the runtime ABI (`girbind.hxx`),
  * which checks the GType, so a member defined once works on every subclass
  * instance, including subclasses from other namespaces.
@@ -12,7 +14,18 @@
  * the top-level {@link generate} joins them. Emitted code is tab-indented.
  */
 
-import type { Class, Field, Func, Namespace, Parameter, Property, ReturnValue, Struct, TypeRef } from '../ir.js';
+import type {
+	Class,
+	Field,
+	Func,
+	Interface,
+	Namespace,
+	Parameter,
+	Property,
+	ReturnValue,
+	Struct,
+	TypeRef,
+} from '../ir.js';
 import { camelCase, factoryName, functionExportNames, isSupported, methodName, primaryConstructor } from '../names.js';
 import type { Repository } from '../parse.js';
 import { type RecordType, shortName, TypeContext } from '../types.js';
@@ -55,17 +68,23 @@ export function boundRecords(ctx: TypeContext): RecordType[] {
 	return ctx.ns.records.map(record => ctx.recordType(record.name)).filter((type): type is RecordType => !!type);
 }
 
-/** A class or record the addon defines natively. */
+/** Interfaces the addon binds: those with a registered GType. */
+export function boundInterfaces(ctx: TypeContext): Interface[] {
+	return ctx.ns.interfaces.filter(iface => iface.typeName);
+}
+
+/** A class, interface or record the addon defines natively. */
 export interface Owner {
 	name: string;
 	cName: string;
 	qualified: string;
-	members: Class | Struct;
+	members: Class | Interface | Struct;
 	/** The constructor bound to JS `new`, if any. */
 	primary?: Func;
 	/** Declaration of `self`, read and type-checked from `this`. */
 	self: string;
 	record?: RecordType;
+	isInterface?: boolean;
 }
 
 export function classOwner(ctx: TypeContext, cls: Class): Owner {
@@ -78,6 +97,18 @@ export function classOwner(ctx: TypeContext, cls: Class): Owner {
 		members: cls,
 		primary: primary && isSupported(primary) ? primary : undefined,
 		self: `${cls.cName}* self = girbind::unwrap_object<${cls.cName}>(info.This(), ${ctx.gtypeExpression(type)}, "${type.qualified}");`,
+	};
+}
+
+export function interfaceOwner(ctx: TypeContext, iface: Interface, qualified = ctx.qualify(iface.name)): Owner {
+	const type = ctx.objectType(qualified)!;
+	return {
+		name: iface.name,
+		cName: iface.cName,
+		qualified: type.qualified,
+		members: iface,
+		self: `${iface.cName}* self = girbind::unwrap_object<${iface.cName}>(info.This(), ${ctx.gtypeExpression(type)}, "${type.qualified}");`,
+		isInterface: true,
 	};
 }
 
@@ -129,7 +160,7 @@ function memberNames(owner: Owner): Set<string> {
 export function properties(owner: Owner): Property[] {
 	if (owner.record) return [];
 	const taken = memberNames(owner);
-	return (owner.members as Class).properties.filter(p => !taken.has(propJsName(p)));
+	return (owner.members as Class | Interface).properties.filter(p => !taken.has(propJsName(p)));
 }
 
 /** How a record field converts, or undefined when it is not exposed. */
@@ -161,7 +192,7 @@ function propJsName(p: Property): string {
 }
 
 /** Whether a parameter is the trailing `GError**` that GIRs without `throws` still list. */
-function isErrorParam(p: Parameter): boolean {
+export function isErrorParam(p: Parameter): boolean {
 	return p.type.cType.replace(/\s/g, '') === 'GError**';
 }
 
@@ -313,12 +344,12 @@ function* standalone(ctx: TypeContext, func: Func): Lines {
 }
 
 /** Find the instance method implementing a property accessor, searching this namespace's hierarchy from `cls`. */
-function accessorMethod(ctx: TypeContext, cls: Class, methodGirName: string | undefined): Func | undefined {
+function accessorMethod(ctx: TypeContext, cls: Class | Interface, methodGirName: string | undefined): Func | undefined {
 	if (!methodGirName) return undefined;
 	for (
-		let current: Class | undefined = cls;
+		let current: Class | Interface | undefined = cls;
 		current;
-		current = current.parent ? ctx.ourClass(current.parent) : undefined
+		current = 'parent' in current && current.parent ? ctx.ourClass(current.parent) : undefined
 	) {
 		const found = current.methods.find(m => m.name === methodGirName);
 		if (found) return found;
@@ -331,23 +362,23 @@ function valueParams(func: Func): Parameter[] {
 	return func.parameters.filter(sp => !sp.isInstance && !isErrorParam(sp));
 }
 
-function getterMethod(ctx: TypeContext, cls: Class, p: Property): Func | undefined {
+function getterMethod(ctx: TypeContext, cls: Class | Interface, p: Property): Func | undefined {
 	const candidate = accessorMethod(ctx, cls, p.getter);
 	return candidate && isSupported(candidate) && !valueParams(candidate).length ? candidate : undefined;
 }
 
-function setterMethod(ctx: TypeContext, cls: Class, p: Property): Func | undefined {
+function setterMethod(ctx: TypeContext, cls: Class | Interface, p: Property): Func | undefined {
 	const candidate = accessorMethod(ctx, cls, p.setter);
 	return candidate && isSupported(candidate) && valueParams(candidate).length === 1 ? candidate : undefined;
 }
 
-export function hasSetter(ctx: TypeContext, cls: Class, p: Property): boolean {
+export function hasSetter(ctx: TypeContext, cls: Class | Interface, p: Property): boolean {
 	if (!p.writable) return false;
 	return !!setterMethod(ctx, cls, p) || !p.constructOnly;
 }
 
 function* propertyAccessors(ctx: TypeContext, owner: Owner, p: Property): Lines {
-	const cls = owner.members as Class;
+	const cls = owner.members as Class | Interface;
 	const getter = getterMethod(ctx, cls, p);
 	const setter = setterMethod(ctx, cls, p);
 
@@ -433,7 +464,7 @@ function accessorEntries(ctx: TypeContext, owner: Owner): [string, string, strin
 		entries.push([
 			propJsName(p),
 			p.readable ? `${owner.name}_get_${propId(p)}` : 'nullptr',
-			hasSetter(ctx, owner.members as Class, p) ? `${owner.name}_set_${propId(p)}` : 'nullptr',
+			hasSetter(ctx, owner.members as Class | Interface, p) ? `${owner.name}_set_${propId(p)}` : 'nullptr',
 		]);
 	}
 	for (const field of fields(ctx, owner)) {
@@ -456,7 +487,18 @@ function* ownerDef(ctx: TypeContext, owner: Owner): Lines {
 	yield* ownerDefinition(ctx, owner);
 }
 
-/** The function defining a class on `parent`, with its members, and registering it with the runtime. */
+/** GType names of the interfaces a class implements, whose members the runtime adds to its prototype. */
+function implemented(ctx: TypeContext, owner: Owner): string[] {
+	if (owner.record || owner.isInterface) return [];
+	return (owner.members as Class).implements
+		.map(qualified => ctx.anyInterface(qualified)?.typeName)
+		.filter((typeName): typeName is string => !!typeName);
+}
+
+/**
+ * The function defining a class on `parent`, or an interface, with its
+ * members, and registering it with the runtime.
+ */
 function* ownerDefinition(ctx: TypeContext, owner: Owner): Lines {
 	const constructor = hasConstructor(owner) ? `construct_${owner.name}` : 'nullptr';
 	yield `const girbind::ClassInfo info_${owner.name} = {"${owner.name}", ${constructor}};`;
@@ -465,8 +507,15 @@ function* ownerDefinition(ctx: TypeContext, owner: Owner): Lines {
 		yield `const girbind::Accessor ${owner.name}_accessor_${name} = {${get}, ${set}};`;
 	}
 	yield '';
-	yield `Napi::Function define_${owner.name}(Napi::Env env, Napi::Function parent) {`;
-	yield `\tNapi::Function cls = girbind::define_class(env, info_${owner.name}, "${registeredName(ctx, owner)}", parent);`;
+	const typeName = registeredName(ctx, owner);
+	if (owner.isInterface) {
+		yield `Napi::Function define_${owner.name}(Napi::Env env) {`;
+		yield `\tNapi::Function cls = girbind::define_interface(env, info_${owner.name}, "${typeName}");`;
+	} else {
+		const interfaces = implemented(ctx, owner).map(name => `"${name}"`);
+		yield `Napi::Function define_${owner.name}(Napi::Env env, Napi::Function parent) {`;
+		yield `\tNapi::Function cls = girbind::define_class(env, info_${owner.name}, "${typeName}", parent, {${interfaces.join(', ')}});`;
+	}
 	yield '\tNapi::Object prototype = cls.Get("prototype").As<Napi::Object>();';
 	for (const f of methods(owner)) {
 		yield `\tgirbind::define_method(prototype, "${methodName(f)}", ${owner.name}_${methodName(f)});`;
@@ -551,7 +600,7 @@ function* convertToJs(
 		return;
 	}
 	if (t === 'utf8' || t === 'filename') {
-		yield `Napi::String ${varName}_js = Napi::String::New(env, ${varName} ? (const char*)${varName} : "");`;
+		yield `Napi::Value ${varName}_js = ${varName} ? Napi::Value(Napi::String::New(env, (const char*)${varName})) : env.Null();`;
 		if (transfer !== 'none') yield `g_free((gpointer)${varName});`;
 		yield emit(`${varName}_js`);
 		return;
@@ -655,8 +704,6 @@ function* convertArrayToJs(
 /** An output parameter whose value is collected into the function result. */
 interface OutParam {
 	name: string;
-	/** Key of this value in a multi-value result object. */
-	key: string;
 	type: TypeRef;
 	transfer: ReturnValue['transfer'];
 }
@@ -771,9 +818,15 @@ function* param(ctx: TypeContext, p: Parameter, index: number, cppParams: string
 		// strip exactly one pointer level from the c:type.
 		const stripped = p.type.cType.replace(/\*\s*$/, '').trim() || ctx.cBaseType(p.type);
 		const local = stripped === 'void' ? 'gpointer' : stripped;
-		yield `${local} out_${p.name} = ${local.endsWith('*') || local === 'gpointer' ? 'NULL' : '{}'};`;
+		if (p.direction === 'inout') {
+			const input = { ...p, direction: 'in' as const, type: { ...p.type, cType: local } };
+			const value = yield* fromJs(ctx, input, `info[${index}]`, `arg_${p.name}`);
+			yield `${local} out_${p.name} = ${value};`;
+		} else {
+			yield `${local} out_${p.name} = ${local.endsWith('*') || local === 'gpointer' ? 'NULL' : '{}'};`;
+		}
 		cppParams.push(`&out_${p.name}`);
-		outParams.push({ name: `out_${p.name}`, key: p.name, type: { ...p.type, cType: local }, transfer: p.transfer });
+		outParams.push({ name: `out_${p.name}`, type: { ...p.type, cType: local }, transfer: p.transfer });
 		return;
 	}
 
@@ -799,7 +852,7 @@ function* emitParams(
 		if (p.isInstance) continue;
 		yield* param(ctx, p, jsIndex, cppParams, outParams);
 		// Output params do not consume a JS argument slot.
-		if (p.direction === 'in' && !isErrorParam(p)) jsIndex++;
+		if (p.direction !== 'out' && !isErrorParam(p)) jsIndex++;
 	}
 	return outParams;
 }
@@ -808,7 +861,7 @@ function* emitParams(
  * After the C call, produce the JS return from the real return value plus any
  * output parameters: a lone out-param (with void return) becomes the result; a
  * void return with no out-params yields `undefined`; multiple values become an
- * object keyed by parameter name.
+ * array of the return value (if any) followed by the out-params in order.
  */
 function* emitResult(ctx: TypeContext, func: Func, resultVar: string | null, outParams: OutParam[]): Lines {
 	const hasReturn = resultVar !== null;
@@ -827,20 +880,13 @@ function* emitResult(ctx: TypeContext, func: Func, resultVar: string | null, out
 		return;
 	}
 
-	// Multiple values: bundle into an object. The real return (if any) is keyed
-	// "return"; each out-param under its (stripped) name.
-	yield 'Napi::Object js_result = Napi::Object::New(env);';
-	if (hasReturn) {
-		yield* convertToJs(
-			ctx,
-			func.returnValue.type,
-			func.returnValue.transfer,
-			resultVar,
-			v => `js_result.Set("return", ${v});`
-		);
-	}
-	for (const o of outParams) {
-		yield* convertToJs(ctx, o.type, o.transfer, o.name, v => `js_result.Set("${o.key}", ${v});`);
+	yield 'Napi::Array js_result = Napi::Array::New(env);';
+	const values = [
+		...(hasReturn ? [{ type: func.returnValue.type, transfer: func.returnValue.transfer, name: resultVar }] : []),
+		...outParams,
+	];
+	for (const [index, value] of values.entries()) {
+		yield* convertToJs(ctx, value.type, value.transfer, value.name, v => `js_result.Set(${index}u, ${v});`);
 	}
 	yield 'return js_result;';
 }
@@ -856,6 +902,7 @@ function* moduleInit(ctx: TypeContext, moduleName: string): Lines {
 	for (const { record } of boundRecords(ctx)) {
 		yield `\texports.Set("${record.name}", define_${record.name}(env, girbind::lookup(env, "GBoxed")));`;
 	}
+	for (const iface of boundInterfaces(ctx)) yield `\texports.Set("${iface.name}", define_${iface.name}(env));`;
 	for (const cls of boundClasses(ctx)) {
 		const parent = ctx.boundParent(cls);
 		const parentExpression =
@@ -918,6 +965,7 @@ function* file(ns: Namespace, options: Options): Lines {
 
 	const body = [
 		...boundRecords(ctx).flatMap(type => [...ownerDef(ctx, recordOwner(ctx, type))]),
+		...boundInterfaces(ctx).flatMap(iface => [...ownerDef(ctx, interfaceOwner(ctx, iface))]),
 		...boundClasses(ctx).flatMap(cls => [...ownerDef(ctx, classOwner(ctx, cls))]),
 		...ns.functions.filter(isSupported).flatMap(func => [...standalone(ctx, func)]),
 		...moduleInit(ctx, moduleName),

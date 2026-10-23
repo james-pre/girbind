@@ -431,6 +431,14 @@ export function parseGir(xml: string): Namespace {
 				if (!info) return undefined;
 				return {
 					...info,
+					prerequisites: children(node, 'prerequisite')
+						.map(prerequisite => attr(prerequisite, 'name'))
+						.filter((prerequisite): prerequisite is string => !!prerequisite)
+						.map(prerequisite => qualify(prerequisite, name)),
+					...parseMembers(node),
+					properties: children(node, 'property')
+						.map(parseProperty)
+						.filter((p): p is Property => !!p),
 					signals: children(node, 'glib:signal')
 						.map(parseSignal)
 						.filter((s): s is Signal => !!s),
@@ -529,16 +537,18 @@ function bindRecords(repository: Repository, callbacks: Set<string>): void {
 function annotateParameters(repository: Repository): void {
 	const callbacks = new Set<string>();
 	const records = new Map<string, Struct>();
+	const enumerations = new Set<string>();
 	for (const ns of repository.values()) {
 		for (const callback of ns.callbacks) callbacks.add(`${ns.name}.${callback}`);
 		for (const record of ns.records) records.set(`${ns.name}.${record.name}`, record);
+		for (const enumeration of ns.enumerations) enumerations.add(`${ns.name}.${enumeration.name}`);
 	}
 	bindRecords(repository, callbacks);
 
 	for (const ns of repository.values()) {
 		const functions = [
 			...ns.functions,
-			...[...ns.classes, ...ns.records].flatMap(owner => [
+			...[...ns.classes, ...ns.interfaces, ...ns.records].flatMap(owner => [
 				...owner.constructors,
 				...owner.methods,
 				...owner.staticMethods,
@@ -550,6 +560,14 @@ function annotateParameters(repository: Repository): void {
 		for (const parameter of functions.flatMap(func => func.parameters)) {
 			const qualified = qualify(parameter.type.girType, ns.name);
 			if (callbacks.has(qualified)) parameter.isCallback = true;
+			if (parameter.direction === 'inout') {
+				const scalar =
+					!parameter.type.isArray
+					&& (SCALAR_GIR_TYPES.has(parameter.type.girType) || enumerations.has(qualified))
+					&& (parameter.type.cType.match(/\*/g) ?? []).length === 1;
+				if (!scalar) parameter.isComplexInout = true;
+				continue;
+			}
 			const record = records.get(qualified);
 			if (parameter.direction === 'in' || !record || /\*\s*\*/.test(parameter.type.cType)) continue;
 			if (record.binding && !record.isOpaque && record.fields.length) parameter.fillsRecord = true;

@@ -9,6 +9,10 @@ export interface Native {
 	address(handle: Handle): number;
 	/** GType names of an object's instance type and its ancestors, most derived first. */
 	typeChain(handle: Handle): string[];
+	/** GType names of the interfaces an object's instance type implements. */
+	interfaces(handle: Handle): string[];
+	/** Whether the handle's value is an instance of the GType named `typeName`. */
+	isA(handle: Handle, typeName: string): boolean;
 	release(handle: Handle): void;
 	watchFinalization(handle: Handle): void;
 	/** Number of watched objects finalized so far. */

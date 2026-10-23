@@ -21,9 +21,10 @@ function returnsScalarPointer(func: Func): boolean {
 
 /**
  * Whether girbind can currently emit a binding for a function. Skipped for now:
- * callbacks (a parameter with a GIR `scope`), varargs and `va_list`, and
- * caller-allocated out parameters. Used by every emitter so the JS/TS/C++
- * exported sets stay identical.
+ * callbacks (a parameter with a GIR `scope`), varargs and `va_list`,
+ * caller-allocated out parameters other than records, and inout parameters
+ * other than scalars. Used by every emitter so the JS/TS/C++ exported sets stay
+ * identical.
  */
 export function isSupported(func: Func): boolean {
 	return (
@@ -32,6 +33,7 @@ export function isSupported(func: Func): boolean {
 				p.scope !== undefined
 				|| p.isCallback
 				|| p.isRecordOut
+				|| p.isComplexInout
 				|| p.name === '...'
 				|| p.type.cType.includes('va_list')
 				|| (p.direction !== 'in' && p.callerAllocates && !p.fillsRecord)

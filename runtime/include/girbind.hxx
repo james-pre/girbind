@@ -2,13 +2,15 @@
 //
 // A wrapper object stores its native value as a type-tagged `External` under
 // `Symbol.for("girbind.handle")`. Any addon can read a handle; wrappers for
-// existing objects are created by the runtime's `wrap`, and classes are
-// registered with the runtime by GType name so other addons can extend them.
+// existing objects are created by the runtime's `wrap`, and classes and
+// interfaces are registered with the runtime by GType name so other addons can
+// extend and implement them.
 // The layout of `Handle` is part of the ABI: change `abi_version` with it.
 
 #pragma once
 
 #include <cstring>
+#include <initializer_list>
 #include <glib-object.h>
 #include <napi.h>
 #include <string>
@@ -16,7 +18,7 @@
 
 namespace girbind {
 
-inline constexpr uint32_t abi_version = 2;
+inline constexpr uint32_t abi_version = 3;
 
 enum class Kind : uint32_t { Object, Boxed, Plain };
 
@@ -73,6 +75,7 @@ struct Runtime {
 	Napi::FunctionReference wrap;
 	Napi::FunctionReference attach;
 	Napi::FunctionReference register_class;
+	Napi::FunctionReference register_interface;
 	Napi::FunctionReference lookup;
 	Napi::Reference<Napi::Symbol> key;
 	Napi::Reference<Napi::Symbol> adopt;
@@ -101,6 +104,7 @@ inline void init(const Napi::CallbackInfo &info) {
 		Napi::Persistent(abi.Get("wrap").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("attach").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("register").As<Napi::Function>()),
+		Napi::Persistent(abi.Get("registerInterface").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("lookup").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("handle").As<Napi::Symbol>()),
 		Napi::Persistent(abi.Get("adopt").As<Napi::Symbol>()),
@@ -208,21 +212,45 @@ inline Napi::Function lookup(Napi::Env env, const char *type_name) {
 	return runtime(env).lookup.Call({Napi::String::New(env, type_name)}).As<Napi::Function>();
 }
 
-/** Define a class extending `parent` and register it with the runtime under `type_name`. */
-inline Napi::Function define_class(Napi::Env env, const ClassInfo &info, const char *type_name, Napi::Function parent) {
+inline Napi::Function new_class(Napi::Env env, const ClassInfo &info) {
 	napi_value constructor;
 	napi_status status = napi_define_class(
 		env, info.name, NAPI_AUTO_LENGTH, invoke_constructor, const_cast<ClassInfo *>(&info), 0, nullptr, &constructor
 	);
 	if (status != napi_ok)
 		throw Napi::Error::New(env);
-	Napi::Function cls(env, constructor);
+	return Napi::Function(env, constructor);
+}
+
+/**
+ * Define a class extending `parent` and register it with the runtime under
+ * `type_name`, adding the members of the registered `interfaces` it implements.
+ */
+inline Napi::Function define_class(
+	Napi::Env env,
+	const ClassInfo &info,
+	const char *type_name,
+	Napi::Function parent,
+	std::initializer_list<const char *> interfaces
+) {
+	Napi::Function cls = new_class(env, info);
 	Napi::Function set_prototype_of =
 		env.Global().Get("Object").As<Napi::Object>().Get("setPrototypeOf").As<Napi::Function>();
 	set_prototype_of.Call({cls.Get("prototype"), parent.Get("prototype")});
 	set_prototype_of.Call({cls, parent});
-	runtime(env).register_class.Call({Napi::String::New(env, type_name), cls});
+	Napi::Array names = Napi::Array::New(env, interfaces.size());
+	uint32_t index = 0;
+	for (const char *name : interfaces)
+		names.Set(index++, Napi::String::New(env, name));
+	runtime(env).register_class.Call({Napi::String::New(env, type_name), cls, names});
 	return cls;
+}
+
+/** Define an interface, whose prototype holds the members its implementations share, and register it. */
+inline Napi::Function define_interface(Napi::Env env, const ClassInfo &info, const char *type_name) {
+	Napi::Function iface = new_class(env, info);
+	runtime(env).register_interface.Call({Napi::String::New(env, type_name), iface});
+	return iface;
 }
 
 /** Define a non-enumerable method, like a class method in JS. */

@@ -259,6 +259,14 @@ export class TypeContext {
 		return bound.source === 'local' ? shortName(bound.qualified) : bound.qualified;
 	}
 
+	/** The TypeScript expression naming an interface, if it is defined at runtime. */
+	interfaceReference(qualified: string): string | undefined {
+		const [namespace, name] = this.split(qualified);
+		if (!namespace?.interfaces.some(iface => iface.name === name && iface.typeName)) return undefined;
+		if (namespace.name === this.ns.name) return name;
+		return namespace.name in this.modules ? `${namespace.name}.${name}` : undefined;
+	}
+
 	/** Map a GIR type to its TypeScript type. */
 	tsType(type: TypeRef): string {
 		if (type.isArray) {
@@ -277,7 +285,10 @@ export class TypeContext {
 			return namespace && namespace.name in this.modules ? `${namespace.name}.${enumeration.name}` : 'number';
 		}
 		const object = this.objectType(girType);
-		if (object) return object.isInterface ? 'GObject.Object' : this.classReference(object.qualified);
+		if (object) {
+			if (!object.isInterface) return this.classReference(object.qualified);
+			return this.interfaceReference(object.qualified) ?? 'GObject.Object';
+		}
 		const record = this.recordType(girType);
 		if (record) {
 			if (record.namespace === this.ns.name) return record.record.name;

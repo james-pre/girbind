@@ -77,6 +77,29 @@ Napi::Value type_chain(const Napi::CallbackInfo &info) {
 	return chain;
 }
 
+/** The GType names of the interfaces an object handle's type implements. */
+Napi::Value interfaces(const Napi::CallbackInfo &info) {
+	Napi::Env env = info.Env();
+	girbind::Handle *handle = expect_handle(info);
+	Napi::Array names = Napi::Array::New(env);
+	if (handle->kind != girbind::Kind::Object)
+		return names;
+	guint count = 0;
+	GType *types = g_type_interfaces(G_OBJECT_TYPE(handle->pointer), &count);
+	for (guint i = 0; i < count; i++)
+		names.Set(i, Napi::String::New(env, g_type_name(types[i])));
+	g_free(types);
+	return names;
+}
+
+/** Whether a handle's value is an instance of the type named by the second argument. */
+Napi::Value is_a(const Napi::CallbackInfo &info) {
+	girbind::Handle *handle = expect_handle(info);
+	GType type = g_type_from_name(info[1].As<Napi::String>().Utf8Value().c_str());
+	bool result = type && handle->kind == girbind::Kind::Object && g_type_is_a(G_OBJECT_TYPE(handle->pointer), type);
+	return Napi::Boolean::New(info.Env(), result);
+}
+
 /** Drop a handle's reference now instead of when it is collected. */
 Napi::Value release(const Napi::CallbackInfo &info) {
 	girbind::release(expect_handle(info));
@@ -460,6 +483,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 	exports.Set("$init", Napi::Function::New(env, init_self));
 	exports.Set("address", Napi::Function::New(env, address));
 	exports.Set("typeChain", Napi::Function::New(env, type_chain));
+	exports.Set("interfaces", Napi::Function::New(env, interfaces));
+	exports.Set("isA", Napi::Function::New(env, is_a));
 	exports.Set("release", Napi::Function::New(env, release));
 	exports.Set("watchFinalization", Napi::Function::New(env, watch_finalization));
 	exports.Set("finalized", Napi::Function::New(env, finalized));
