@@ -104,7 +104,11 @@ function hasConstructor(owner: Owner): boolean {
 	return !!owner.primary || zeroConstructible(owner);
 }
 
-export const methods = (owner: Owner) => owner.members.methods.filter(isSupported);
+/** Reference-counting and freeing methods, which would unbalance the reference a wrapper owns. */
+const lifecycleMethods = new Set(['ref', 'unref', 'ref_sink', 'free']);
+
+export const methods = (owner: Owner) =>
+	owner.members.methods.filter(func => isSupported(func) && !lifecycleMethods.has(func.name));
 export const statics = (owner: Owner) => owner.members.staticMethods.filter(isSupported);
 /** The constructor bound to JS `new`: `new` (or the first constructor) for classes, only `new` for records. */
 function primaryOf(owner: Owner): Func | undefined {
@@ -251,11 +255,43 @@ function mayReturnSelf(ctx: TypeContext, owner: Owner, func: Func): boolean {
 	return !!owner.record && rv.transfer === 'none' && ctx.qualify(rv.type.girType) === owner.qualified;
 }
 
+/** The `self` argument, as a new reference or copy when the method takes ownership of its instance. */
+function selfArgument(ctx: TypeContext, owner: Owner, func: Func): string {
+	const instance = func.parameters.find(p => p.isInstance);
+	if (!instance || instance.transfer === 'none') return 'self';
+	if (!owner.record) return `(${owner.cName}*)g_object_ref(self)`;
+	return ownedRecord(ctx, owner.record, 'self');
+}
+
+/** A new copy of the record at `pointer` that the callee will own. */
+function ownedRecord(ctx: TypeContext, type: RecordType, pointer: string): string {
+	const cName = type.record.cName;
+	return type.binding === 'boxed'
+		? `(${cName}*)(${pointer} ? g_boxed_copy(${ctx.recordGType(type)}, ${pointer}) : NULL)`
+		: `(${cName}*)(${pointer} ? memcpy(g_malloc(sizeof(${cName})), ${pointer}, sizeof(${cName})) : NULL)`;
+}
+
+/** An in argument the callee takes ownership of (`transfer full`), as its own reference or copy. */
+function ownedArgument(ctx: TypeContext, p: Parameter, local: string, expression: string): string {
+	if (p.transfer === 'none') return expression;
+	const t = p.type.girType;
+	const cast = p.type.cType ? `(${p.type.cType})` : '';
+	if (ctx.objectType(t)) return `${cast}(${local} ? g_object_ref(${local}) : NULL)`;
+	const record = ctx.recordType(t);
+	if (record && !isScalarCType(p.type.cType)) return `${cast}${ownedRecord(ctx, record, local)}`;
+	const isString = t === 'utf8' || t === 'filename';
+	if ((p.type.isArray && ctx.arrayKind(p.type) === 'strv') || (isString && /\*\s*\*/.test(p.type.cType))) {
+		return `${cast}g_strdupv((gchar**)${local})`;
+	}
+	if (isString) return `${cast}g_strdup(${local})`;
+	return expression;
+}
+
 function* method(ctx: TypeContext, owner: Owner, func: Func): Lines {
 	yield `Napi::Value ${owner.name}_${methodName(func)}(const Napi::CallbackInfo& info) {`;
 	yield '\tNapi::Env env = info.Env();';
 	yield `\t${owner.self}`;
-	yield* indent(...callAndReturn(ctx, func, ['self'], mayReturnSelf(ctx, owner, func)));
+	yield* indent(...callAndReturn(ctx, func, [selfArgument(ctx, owner, func)], mayReturnSelf(ctx, owner, func)));
 	yield '}';
 	yield '';
 }
@@ -340,7 +376,13 @@ function* propertyAccessors(ctx: TypeContext, owner: Owner, p: Property): Lines 
 	yield '\tNapi::Env env = info.Env();';
 	if (setter) {
 		yield `\t${owner.self}`;
-		const value = yield* indented(fromJs(ctx, valueParams(setter)[0], 'info[0]', 'value'));
+		const valueParam = valueParams(setter)[0];
+		const value = ownedArgument(
+			ctx,
+			valueParam,
+			'value',
+			yield* indented(fromJs(ctx, valueParam, 'info[0]', 'value'))
+		);
 		const err = errorParam(setter);
 		if (err) yield `\tGError* ${err} = NULL;`;
 		yield `\t${callExpr(setter.cName, [`(${setter.parameters[0]?.type.cType || `${cls.cName}*`})self`, value], err)}`;
@@ -735,7 +777,8 @@ function* param(ctx: TypeContext, p: Parameter, index: number, cppParams: string
 		return;
 	}
 
-	cppParams.push(yield* fromJs(ctx, p, `info[${index}]`, `arg_${p.name}`));
+	const local = `arg_${p.name}`;
+	cppParams.push(ownedArgument(ctx, p, local, yield* fromJs(ctx, p, `info[${index}]`, local)));
 }
 
 /**

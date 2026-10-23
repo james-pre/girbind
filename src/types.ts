@@ -7,7 +7,7 @@
  * (everything else — boxed records, fundamental types, unknown namespaces).
  */
 
-import type { Class, Enumeration, Namespace, RecordBinding, Struct, TypeInfo, TypeRef } from './ir.js';
+import type { Class, Enumeration, Interface, Namespace, RecordBinding, Struct, TypeInfo, TypeRef } from './ir.js';
 import type { Repository } from './parse.js';
 import girToCxx from './types/cxx.json' with { type: 'json' };
 import girToTs from './types/ts.json' with { type: 'json' };
@@ -88,6 +88,12 @@ export class TypeContext {
 		const qualified = this.qualify(girType);
 		const dot = qualified.lastIndexOf('.');
 		return [this.repository.get(qualified.slice(0, dot)), qualified.slice(dot + 1)];
+	}
+
+	/** An interface from any loaded namespace. */
+	anyInterface(girType: string): Interface | undefined {
+		const [namespace, name] = this.split(girType);
+		return namespace?.interfaces.find(i => i.name === name);
 	}
 
 	/** A class from any loaded namespace. */

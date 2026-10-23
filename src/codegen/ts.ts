@@ -124,43 +124,70 @@ function inNamespace(type: TypeRef, namespace: string): TypeRef {
 	};
 }
 
-/** Signals of a class and its ancestors, nearest first, each with the namespace that declares it. */
-function inheritedSignals(ctx: TypeContext, cls: Class): { signal: Signal; namespace: string }[] {
-	const seen = new Set<string>();
-	const result: { signal: Signal; namespace: string }[] = [];
-	let qualified: string | undefined = ctx.qualify(cls.name);
-	while (qualified) {
+/**
+ * Classes from `cls` up to (excluding) the bound parent its declaration
+ * extends, each with the namespace that declares it. Their signals are the ones
+ * this declaration adds to the signal map.
+ */
+function unboundChain(ctx: TypeContext, cls: Class): { cls: Class; namespace: string }[] {
+	const stop = ctx.boundParent(cls).qualified;
+	const chain: { cls: Class; namespace: string }[] = [];
+	for (let qualified: string | undefined = ctx.qualify(cls.name); qualified && qualified !== stop;) {
 		const current = ctx.anyClass(qualified);
 		if (!current) break;
-		const namespace = qualified.slice(0, qualified.lastIndexOf('.'));
-		for (const signal of current.signals) {
-			if (seen.has(signal.name)) continue;
-			seen.add(signal.name);
-			result.push({ signal, namespace });
-		}
+		chain.push({ cls: current, namespace: qualified.slice(0, qualified.lastIndexOf('.')) });
 		qualified = current.parent;
 	}
-	return result;
+	return chain;
 }
 
-function* signalOverloads(ctx: TypeContext, cls: Class): Lines {
-	for (const { signal, namespace } of inheritedSignals(ctx, cls)) {
-		const args = signal.parameters.map(p => {
-			const type = ctx.tsType(inNamespace(p.type, namespace));
-			return `${parameterName(p.name)}: ${type}${p.nullable ? ' | null' : ''}`;
-		});
-		const rv = signal.returnValue;
-		const result = rv.type.girType === 'none' ? 'void' : `${ctx.tsType(inNamespace(rv.type, namespace))} | void`;
-		yield `\tconnect(signal: '${signal.name}', handler: (self: this${args.map(a => `, ${a}`).join('')}) => ${result}, options?: ConnectOptions): number;`;
-		yield `\tonce(signal: '${signal.name}', options?: Omit<ConnectOptions, 'after'>): Promise<[${args.join(', ')}]>;`;
+/** The signal map a class passes to its parent: arguments (excluding the emitter) and return value, by name. */
+function signalMap(ctx: TypeContext, cls: Class): string {
+	const seen = new Set<string>();
+	const entries: string[] = [];
+	const add = (signals: Signal[], namespace: string) => {
+		for (const signal of signals) {
+			if (seen.has(signal.name)) continue;
+			seen.add(signal.name);
+			const args = signal.parameters.map(p => {
+				const type = ctx.tsType(inNamespace(p.type, namespace));
+				return `${parameterName(p.name)}: ${type}${p.nullable ? ' | null' : ''}`;
+			});
+			const rv = signal.returnValue;
+			const result =
+				rv.type.girType === 'none' ? 'void' : `${ctx.tsType(inNamespace(rv.type, namespace))} | void`;
+			entries.push(`'${signal.name}': (${args.join(', ')}) => ${result}`);
+		}
+	};
+	for (const { cls: owner, namespace } of unboundChain(ctx, cls)) {
+		add(owner.signals, namespace);
+		for (const implemented of owner.implements) {
+			const iface = ctx.anyInterface(implemented);
+			if (iface) add(iface.signals, implemented.slice(0, implemented.lastIndexOf('.')));
+		}
 	}
-	yield '\tconnect(signal: `notify::${string}`, handler: (self: this, pspec: { name: string }) => void, options?: ConnectOptions): number;';
-	yield '\tconnect(signal: string, handler: (self: this, ...args: any[]) => unknown, options?: ConnectOptions): number;';
-	yield "\tonce(signal: string, options?: Omit<ConnectOptions, 'after'>): Promise<unknown[]>;";
+	return entries.length ? `{ ${entries.join('; ')} }` : '{}';
 }
 
-function* members(ctx: TypeContext, owner: Owner): Lines {
+/** JS names of the instance members of every ancestor, which a member of the same name overrides. */
+function ancestorMembers(ctx: TypeContext, cls: Class): Set<string> {
+	const names = new Set<string>();
+	for (let qualified = cls.parent; qualified;) {
+		const current = ctx.anyClass(qualified);
+		if (!current) break;
+		for (const f of current.methods) names.add(methodName(f));
+		for (const p of current.properties) names.add(memberName(p.name));
+		qualified = current.parent;
+	}
+	return names;
+}
+
+function* members(ctx: TypeContext, owner: Owner, inherited = new Set<string>()): Lines {
 	const type = owner.name;
+	// A GIR override may change an inherited member's signature, which TypeScript rejects.
+	const override = function* (name: string): Lines {
+		if (inherited.has(name)) yield '\t// @ts-ignore';
+	};
 	if (owner.primary) yield `\tconstructor(${params(ctx, owner.primary)});`;
 	else if (zeroConstructible(owner)) yield '\tconstructor();';
 	// `protected` (not `private`) so subclasses can still `extends` a return-only
@@ -169,11 +196,18 @@ function* members(ctx: TypeContext, owner: Owner): Lines {
 
 	for (const f of factories(owner)) yield `\tstatic ${factoryName(f)}(${params(ctx, f)}): ${type};`;
 	for (const f of statics(owner)) yield `\tstatic ${methodName(f)}(${params(ctx, f)}): ${ret(ctx, f)};`;
-	for (const f of methods(owner)) yield `\t${methodName(f)}(${params(ctx, f)}): ${ret(ctx, f)};`;
+	for (const f of methods(owner)) {
+		yield* override(methodName(f));
+		yield `\t${methodName(f)}(${params(ctx, f)}): ${ret(ctx, f)};`;
+	}
 	for (const p of properties(owner)) {
 		const propertyType = ctx.tsType(p.type);
+		yield* override(memberName(p.name));
 		if (p.readable) yield `\tget ${memberName(p.name)}(): ${propertyType};`;
-		if (hasSetter(ctx, owner.members as Class, p)) yield `\tset ${memberName(p.name)}(value: ${propertyType});`;
+		if (hasSetter(ctx, owner.members as Class, p)) {
+			yield* override(memberName(p.name));
+			yield `\tset ${memberName(p.name)}(value: ${propertyType});`;
+		}
 	}
 	for (const field of fields(ctx, owner)) {
 		const fieldType = ctx.tsType(field.type);
@@ -183,9 +217,9 @@ function* members(ctx: TypeContext, owner: Owner): Lines {
 }
 
 function* classDecl(ctx: TypeContext, cls: Class): Lines {
-	yield `export declare class ${cls.name} extends ${ctx.classReference(ctx.boundParent(cls).qualified)} {`;
-	yield* members(ctx, classOwner(ctx, cls));
-	yield* signalOverloads(ctx, cls);
+	const parent = ctx.classReference(ctx.boundParent(cls).qualified);
+	yield `export declare class ${cls.name}<S extends object = {}> extends ${parent}<${signalMap(ctx, cls)} & S> {`;
+	yield* members(ctx, classOwner(ctx, cls), ancestorMembers(ctx, cls));
 	yield '}';
 	yield '';
 }
@@ -211,7 +245,7 @@ function* file(ns: Namespace, options: Options): Lines {
 	yield `// Generated by girbind from ${ns.name}-${ns.version}`;
 	yield '// DO NOT EDIT THIS FILE DIRECTLY';
 	yield '';
-	yield "import type { ConnectOptions, GObject } from 'girbind';";
+	yield "import type { GObject } from 'girbind';";
 	for (const name of ctx.importedNamespaces()) yield `import type * as ${name} from '${ctx.modules[name]}';`;
 	yield '';
 	for (const e of ns.enumerations) yield* enumDecl(e);

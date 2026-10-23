@@ -4,7 +4,8 @@ import native from './native.js';
 native.$init(internal);
 
 export * as GObject from './gobject.js';
-export type { ConnectOptions } from './gobject.js';
+export { connect, disconnect, once, signals } from './signals.js';
+export type { ConnectOptions, SignalHandler, SignalMap } from './signals.js';
 export { internal };
 export type { Handle } from './native.js';
 

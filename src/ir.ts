@@ -142,6 +142,12 @@ export interface Class extends TypeInfo {
 	staticMethods: Func[];
 	properties: Property[];
 	signals: Signal[];
+	/** Qualified names of the interfaces the class implements. */
+	implements: string[];
+}
+
+export interface Interface extends TypeInfo {
+	signals: Signal[];
 }
 
 /** A GIR `<enumeration>` or `<bitfield>` and its members. */
@@ -176,7 +182,7 @@ export interface Namespace {
 	/** C symbol prefixes, e.g. `flatpak`. */
 	symbolPrefixes: string[];
 	classes: Class[];
-	interfaces: TypeInfo[];
+	interfaces: Interface[];
 	records: Struct[];
 	unions: TypeInfo[];
 	/** Names of `<callback>` types. */

@@ -18,6 +18,7 @@ import type {
 	Field,
 	Func,
 	Include,
+	Interface,
 	Namespace,
 	Parameter,
 	Property,
@@ -335,6 +336,10 @@ function parseClass(node: Node, nsPrefix: string, namespace: string): Class | un
 		signals: children(node, 'glib:signal')
 			.map(parseSignal)
 			.filter((s): s is Signal => !!s),
+		implements: children(node, 'implements')
+			.map(implemented => attr(implemented, 'name'))
+			.filter((name): name is string => !!name)
+			.map(name => qualify(name, namespace)),
 	};
 }
 
@@ -420,7 +425,18 @@ export function parseGir(xml: string): Namespace {
 		identifierPrefixes,
 		symbolPrefixes: splitPrefixes(attr(nsNode, 'c:symbol-prefixes')),
 		classes,
-		interfaces: typeInfos('interface'),
+		interfaces: children(nsNode, 'interface')
+			.map((node): Interface | undefined => {
+				const info = parseTypeInfo(node, nsPrefix);
+				if (!info) return undefined;
+				return {
+					...info,
+					signals: children(node, 'glib:signal')
+						.map(parseSignal)
+						.filter((s): s is Signal => !!s),
+				};
+			})
+			.filter((iface): iface is Interface => !!iface),
 		records: children(nsNode, 'record')
 			.map(node => parseRecord(node, nsPrefix))
 			.filter((record): record is Struct => !!record),
