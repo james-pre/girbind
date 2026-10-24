@@ -27,6 +27,7 @@ export class Object<Signals extends object = {}> {
 	 * Use it when removing an object whose wrapper is reachable from a handler on
 	 * an object it owns, such as a widget whose controller's handler captures the
 	 * widget, a cycle through C that garbage collection cannot see.
+	 * Remove a widget from its parent before disposing it.
 	 */
 	dispose(): void {
 		native.dispose((this as unknown as Record<typeof handle, Handle>)[handle]);
