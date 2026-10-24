@@ -21,14 +21,17 @@ function returnsScalarPointer(func: Func): boolean {
 
 /**
  * Whether girbind can currently emit a binding for a function. Skipped for now:
- * callbacks girbind cannot call JS through, varargs and `va_list`,
+ * callbacks girbind cannot call JS through, `GClosure`s, varargs and `va_list`,
  * caller-allocated out parameters other than records, inout parameters other
- * than scalars, and arrays it cannot convert. Used by every emitter so the
- * JS/TS/C++ exported sets stay identical.
+ * than scalars, arrays it cannot convert, functions the GIR marks as not
+ * introspectable, and functions replaced by a bound function shadowing them. Used by every emitter so the JS/TS/C++ exported sets stay
+ * identical.
  */
 export function isSupported(func: Func): boolean {
 	return (
-		!func.parameters.some(
+		func.introspectable
+		&& !func.isShadowed
+		&& !func.parameters.some(
 			p =>
 				!p.isHidden
 				&& ((p.scope !== undefined && !p.isBindableCallback)
@@ -38,6 +41,7 @@ export function isSupported(func: Func): boolean {
 					|| p.isOpaqueArray
 					|| p.name === '...'
 					|| p.type.cType.includes('va_list')
+					|| /\bGClosure\b/.test(p.type.cType)
 					|| (p.direction !== 'in' && p.callerAllocates && !p.fillsRecord))
 		)
 		&& !returnsScalarPointer(func)
@@ -72,10 +76,10 @@ export function snakeCase(name: string): string {
 /**
  * JS method name for a function. Preserves `get`/`set`/`is` prefixes
  * (`get_no_interaction` → `getNoInteraction`) — these are part of the public API
- * shape and must not be stripped.
+ * shape and must not be stripped. A function that shadows another takes its name.
  */
 export function methodName(func: Func): string {
-	return camelCase(func.name);
+	return camelCase(func.shadows ?? func.name);
 }
 
 /**

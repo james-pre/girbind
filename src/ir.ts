@@ -90,6 +90,12 @@ export interface Func {
 	isStatic: boolean;
 	/** True when the function takes a trailing `GError**` (`throws="1"`). */
 	throws: boolean;
+	/** False for `introspectable="0"` functions, which bindings must not expose. */
+	introspectable: boolean;
+	/** Name of the function this one replaces in bindings (`shadows`), whose JS name it takes. */
+	shadows?: string;
+	/** True for a function replaced by a bound function that shadows it, set by `loadRepository`. */
+	isShadowed?: boolean;
 	/** Name of the function completing this asynchronous one, from `glib:finish-func`. */
 	finishName?: string;
 	/** The function completing this asynchronous one, which it is bound as a promise of, set by `loadRepository`. */
@@ -174,6 +180,8 @@ export interface Class extends TypeInfo {
 	parent?: string;
 	/** True for `glib:fundamental="1"` classes, which are not GObjects. */
 	fundamental: boolean;
+	/** True for `abstract="1"` classes, which only subclasses instantiate. */
+	abstract: boolean;
 	constructors: Func[];
 	methods: Func[];
 	staticMethods: Func[];
@@ -181,6 +189,10 @@ export interface Class extends TypeInfo {
 	signals: Signal[];
 	/** Qualified names of the interfaces the class implements. */
 	implements: string[];
+	/** Virtual methods, which JS subclasses override as `vfunc_<name>`. */
+	virtualMethods: Func[];
+	/** Name of the class struct holding the virtual methods, e.g. `WidgetClass`. */
+	typeStruct?: string;
 }
 
 export interface Interface extends TypeInfo {

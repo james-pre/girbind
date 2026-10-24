@@ -1,4 +1,4 @@
-// Usage test for generated Gio bindings: interfaces and out parameters.
+// Usage test for generated Gio bindings: interfaces, out parameters, async functions, callbacks and subclasses.
 // Invoked by test/gio.sh with the path to the built entry point (tmp/gio/native/gio.js).
 
 import assert from 'node:assert/strict';
@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { GObject, internal } from 'girbind';
 
 const addonPath = process.argv[2];
 assert.ok(addonPath, 'usage: node test/gio.js <path-to-gio.js>');
@@ -132,6 +133,67 @@ assert.ok(
 assert.equal(Gio.File.newForUri('girbind://anything').getPath(), path, "a notified callback's result is returned to C");
 assert.deepEqual(lookups, ['girbind://anything']);
 assert.ok(vfs.unregisterUriScheme('girbind'), 'its destroy notify frees it');
+
+// --- subclasses ---------------------------------------------------------------
+class Item extends GObject.Object {
+	constructor(label) {
+		super();
+		this.label = label;
+	}
+}
+
+/** Collect garbage until `condition` holds, letting finalizers and WeakRefs settle between rounds. */
+async function collect(condition = () => false) {
+	for (let round = 0; round < 10 && !condition(); round++) {
+		globalThis.gc();
+		await new Promise(resolve => setImmediate(resolve));
+	}
+}
+
+assert.ok(Item.$gtype > 0 && Item.$gtype !== GObject.Object.$gtype, 'a JS subclass gets its own GType');
+const store = new Gio.ListStore(Item.$gtype);
+// Objects are only touched in synchronous functions, so no suspended async frame keeps a wrapper alive.
+const fill = () => {
+	for (const label of ['beta', 'gamma', 'alpha']) {
+		const item = new Item(label);
+		internal.watchFinalization(item);
+		store.append(item);
+	}
+};
+const labels = () => [0, 1, 2].map(i => store.getItem(i).label);
+fill();
+await collect();
+assert.deepEqual(labels(), ['beta', 'gamma', 'alpha'], 'a wrapper lives, with its fields, while C holds its object');
+assert.ok((() => store.getItem(0) instanceof Item && store.getItem(0) === store.getItem(0))());
+
+store.sort((a, b) => a.label.localeCompare(b.label));
+assert.deepEqual(labels(), ['alpha', 'beta', 'gamma'], 'a compare function receives the items as objects');
+
+const before = internal.finalized();
+store.removeAll();
+await collect(() => internal.finalized() - before === 3);
+assert.equal(internal.finalized() - before, 3, 'objects are finalized once neither JS nor C holds them');
+
+const events = [];
+class App extends Gio.Application {
+	vfunc_startup() {
+		super.vfunc_startup();
+		events.push('startup');
+	}
+
+	vfunc_activate() {
+		events.push(`activate ${this.getApplicationId()}`);
+	}
+}
+const app = new App({ applicationId: 'dev.girbind.Test', flags: Gio.ApplicationFlags.non_unique });
+assert.ok(app instanceof Gio.Application);
+app.register(null);
+app.activate();
+assert.deepEqual(events, ['startup', 'activate dev.girbind.Test'], 'GLib calls the overrides, which can chain up');
+assert.throws(() => new App(5), TypeError, 'subclass constructors take an object of properties');
+
+assert.equal(new Gio.SimpleAction({ name: 'save' }).getName(), 'save', 'classes construct from GObject properties');
+assert.throws(() => new Gio.InputStream({}), /abstract/, 'abstract classes are constructed only through subclasses');
 
 rmSync(directory, { recursive: true });
 console.log('gio.js: all assertions passed');

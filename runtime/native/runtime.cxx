@@ -473,6 +473,186 @@ Napi::Value timeout(const Napi::CallbackInfo &info) {
 	return info.Env().Undefined();
 }
 
+// --- subclasses ------------------------------------------------------------------
+
+GType expect_gtype(const Napi::Value &value) {
+	return static_cast<GType>(value.As<Napi::Number>().Int64Value());
+}
+
+/** Installers of virtual method overrides, by the GType name of the class whose class struct declares them. */
+std::map<std::string, girbind::Installer> installers;
+
+/** `virtualMethods(typeName, installer)`: use `installer` for overrides of the virtual methods `typeName` declares. */
+Napi::Value virtual_methods(const Napi::CallbackInfo &info) {
+	installers[info[0].As<Napi::String>().Utf8Value()] =
+		reinterpret_cast<girbind::Installer>(info[1].As<Napi::External<void>>().Data());
+	return info.Env().Undefined();
+}
+
+/** The virtual methods a JS subclass overrides, installed when its class is initialized. */
+struct Subclass {
+	std::vector<std::string> overrides;
+};
+
+void init_subclass(gpointer type_class, gpointer data) {
+	for (const std::string &name : static_cast<Subclass *>(data)->overrides) {
+		bool installed = false;
+		for (GType type = g_type_parent(G_TYPE_FROM_CLASS(type_class)); type && !installed;
+			 type = g_type_parent(type)) {
+			auto installer = installers.find(g_type_name(type));
+			installed = installer != installers.end() && installer->second(type_class, name.c_str());
+		}
+		if (!installed)
+			g_warning(
+				"girbind: %s has no virtual method %s to override", G_OBJECT_CLASS_NAME(type_class), name.c_str()
+			);
+	}
+}
+
+/** A valid GType name for a JS class named `name`, unique among registered types. */
+std::string subclass_type_name(const std::string &name) {
+	std::string base = "girbind_";
+	for (char c : name)
+		base += g_ascii_isalnum(c) || c == '_' || c == '-' ? c : '_';
+	if (name.empty())
+		base += "Anonymous";
+	std::string candidate = base;
+	for (int suffix = 2; g_type_from_name(candidate.c_str()); suffix++)
+		candidate = base + "_" + std::to_string(suffix);
+	return candidate;
+}
+
+/** `registerSubclass(name, parent, overrides)`: register a GType for a JS class, returning it. */
+Napi::Value register_subclass(const Napi::CallbackInfo &info) {
+	Napi::Env env = info.Env();
+	std::string name = info[0].As<Napi::String>().Utf8Value();
+	GType parent = expect_gtype(info[1]);
+	if (!G_TYPE_IS_OBJECT(parent) || !G_TYPE_IS_DERIVABLE(parent))
+		throw Napi::TypeError::New(env, name + " does not extend a GObject class");
+	auto *subclass = new Subclass{};
+	Napi::Array overrides = info[2].As<Napi::Array>();
+	for (uint32_t i = 0; i < overrides.Length(); i++)
+		subclass->overrides.push_back(overrides.Get(i).As<Napi::String>().Utf8Value());
+	GTypeQuery query;
+	g_type_query(parent, &query);
+	GTypeInfo type_info = {};
+	type_info.class_size = static_cast<guint16>(query.class_size);
+	type_info.class_init = init_subclass;
+	type_info.class_data = subclass;
+	type_info.instance_size = static_cast<guint16>(query.instance_size);
+	GType type = g_type_register_static(parent, subclass_type_name(name).c_str(), &type_info, GTypeFlags(0));
+	g_type_set_qdata(type, girbind::subclass_quark(), GINT_TO_POINTER(1));
+	return Napi::Number::New(env, static_cast<double>(type));
+}
+
+/** `typeName(type)`: the name of a GType. */
+Napi::Value type_name(const Napi::CallbackInfo &info) {
+	return Napi::String::New(info.Env(), g_type_name(expect_gtype(info[0])));
+}
+
+/** `typeFromName(name)`: a registered GType by name, or 0. */
+Napi::Value type_from_name(const Napi::CallbackInfo &info) {
+	GType type = g_type_from_name(info[0].As<Napi::String>().Utf8Value().c_str());
+	return Napi::Number::New(info.Env(), static_cast<double>(type));
+}
+
+/** A GObject property name for a JS one: `defaultWidth` and `default_width` both name `default-width`. */
+std::string property_name(const std::string &name) {
+	std::string result;
+	for (char c : name) {
+		if (g_ascii_isupper(c)) {
+			result += '-';
+			result += g_ascii_tolower(c);
+		} else {
+			result += c == '_' ? '-' : c;
+		}
+	}
+	return result;
+}
+
+/** `newObject(type, properties)`: a handle to a new instance of `type`, with the given property values. */
+Napi::Value new_object(const Napi::CallbackInfo &info) {
+	Napi::Env env = info.Env();
+	GType type = expect_gtype(info[0]);
+	if (G_TYPE_IS_ABSTRACT(type))
+		throw Napi::TypeError::New(env, std::string(g_type_name(type)) + " is abstract; construct a subclass instead");
+	std::vector<std::string> names;
+	std::vector<GValue> values;
+	auto *type_class = static_cast<GObjectClass *>(g_type_class_ref(type));
+	auto cleanup = [&] {
+		for (GValue &value : values)
+			g_value_unset(&value);
+		g_type_class_unref(type_class);
+	};
+	try {
+		if (!info[1].IsUndefined() && !info[1].IsNull()) {
+			if (!info[1].IsObject() || info[1].IsArray() || girbind::handle_of(info[1]))
+				throw Napi::TypeError::New(env, "Expected an object of GObject properties");
+			Napi::Object properties = info[1].As<Napi::Object>();
+			Napi::Array keys = properties.GetPropertyNames();
+			for (uint32_t i = 0; i < keys.Length(); i++) {
+				std::string key = keys.Get(i).As<Napi::String>().Utf8Value();
+				GParamSpec *spec = g_object_class_find_property(type_class, property_name(key).c_str());
+				if (!spec)
+					throw Napi::TypeError::New(env, std::string(g_type_name(type)) + " has no property " + key);
+				names.push_back(spec->name);
+				values.push_back(G_VALUE_INIT);
+				g_value_init(&values.back(), spec->value_type);
+				girbind::value_from_js(properties.Get(keys.Get(i)), &values.back());
+			}
+		}
+	} catch (...) {
+		cleanup();
+		throw;
+	}
+	std::vector<const char *> pointers;
+	for (const std::string &name : names)
+		pointers.push_back(name.c_str());
+	GObject *object =
+		g_object_new_with_properties(type, static_cast<guint>(names.size()), pointers.data(), values.data());
+	cleanup();
+	return girbind::object_handle(env, object, true);
+}
+
+void toggle_wrapper(gpointer data, GObject *, gboolean is_last_ref) {
+	auto *toggle = static_cast<girbind::Toggle *>(data);
+	if (!girbind::on_main_thread()) {
+		if (girbind::environment.alive)
+			g_critical(
+				"girbind: a JS subclass instance was referenced from another thread; its wrapper may be collected"
+			);
+		return;
+	}
+	if (is_last_ref == !toggle->strong)
+		return;
+	toggle->strong = !is_last_ref;
+	uint32_t count;
+	if (toggle->strong)
+		napi_reference_ref(toggle->env, toggle->wrapper, &count);
+	else
+		napi_reference_unref(toggle->env, toggle->wrapper, &count);
+}
+
+/**
+ * `toggle(handle, wrapper)`: if the handle is to a JS subclass instance, hold it
+ * through a toggle reference that keeps `wrapper` alive while C also holds it.
+ */
+Napi::Value toggle(const Napi::CallbackInfo &info) {
+	Napi::Env env = info.Env();
+	girbind::Handle *handle = expect_handle(info);
+	if (handle->kind != girbind::Kind::Object || handle->toggle ||
+		!g_type_get_qdata(G_OBJECT_TYPE(handle->pointer), girbind::subclass_quark()))
+		return env.Undefined();
+	auto *toggle = new girbind::Toggle{env, nullptr, toggle_wrapper};
+	napi_create_reference(env, info[1], 0, &toggle->wrapper);
+	handle->toggle = toggle;
+	GObject *object = G_OBJECT(handle->pointer);
+	g_object_add_toggle_ref(object, toggle_wrapper, toggle);
+	g_object_unref(object);
+	toggle_wrapper(toggle, object, object->ref_count == 1);
+	return env.Undefined();
+}
+
 Napi::Value init_self(const Napi::CallbackInfo &info) {
 	girbind::init(info);
 	return info.Env().Undefined();
@@ -493,6 +673,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 	exports.Set("connect", Napi::Function::New(env, connect));
 	exports.Set("disconnect", Napi::Function::New(env, disconnect));
 	exports.Set("timeout", Napi::Function::New(env, timeout));
+	exports.Set("virtualMethods", Napi::Function::New(env, virtual_methods));
+	exports.Set("registerSubclass", Napi::Function::New(env, register_subclass));
+	exports.Set("typeName", Napi::Function::New(env, type_name));
+	exports.Set("typeFromName", Napi::Function::New(env, type_from_name));
+	exports.Set("newObject", Napi::Function::New(env, new_object));
+	exports.Set("toggle", Napi::Function::New(env, toggle));
 	start_pump(env);
 	return exports;
 }

@@ -27,6 +27,17 @@ export interface Native {
 	disconnect(handle: Handle, id: number): void;
 	/** Call `callback` once from a GLib timeout source after `delay` milliseconds. */
 	timeout(delay: number, callback: () => void): void;
+	/** Use `installer` for overrides of the virtual methods the class named `typeName` declares. */
+	virtualMethods(typeName: string, installer: object): void;
+	/** Register a GType named after `name`, extending `parent` and overriding the virtual methods `overrides`. */
+	registerSubclass(name: string, parent: number, overrides: string[]): number;
+	typeName(type: number): string;
+	/** A registered GType by name, or 0. */
+	typeFromName(name: string): number;
+	/** A handle to a new instance of `type` with the given GObject properties. */
+	newObject(type: number, properties: unknown): Handle;
+	/** Hold a JS subclass instance through a toggle reference keeping `wrapper` alive while C also holds it. */
+	toggle(handle: Handle, wrapper: object): void;
 }
 
 const require = createRequire(import.meta.url);

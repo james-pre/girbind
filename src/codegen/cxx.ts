@@ -488,7 +488,170 @@ function* ownerDef(ctx: TypeContext, owner: Owner): Lines {
 	for (const f of methods(owner)) yield* method(ctx, owner, f);
 	for (const p of properties(owner)) yield* propertyAccessors(ctx, owner, p);
 	for (const field of fields(ctx, owner)) yield* fieldAccessors(ctx, owner, field);
+	for (const vfunc of virtualMethods(ctx, owner)) {
+		yield* overrideFunction(ctx, owner, vfunc);
+		yield* chainUp(ctx, owner, vfunc);
+	}
+	yield* installer(ctx, owner);
 	yield* ownerDefinition(ctx, owner);
+}
+
+/** The class struct of a class, which holds its virtual methods. */
+function typeStruct(ctx: TypeContext, owner: Owner): Struct | undefined {
+	if (owner.record || owner.isInterface) return undefined;
+	const name = (owner.members as Class).typeStruct;
+	return ctx.ns.records.find(record => record.name === name);
+}
+
+/** Whether a virtual method's argument converts to JS, or its out argument from JS. */
+function convertsArgument(ctx: TypeContext, p: Parameter): boolean {
+	if (p.type.isArray || ctx.anyCallback(ctx.qualify(p.type.girType))) return false;
+	if (p.direction === 'in') return ctx.convertsToJs(p.type);
+	const t = p.type.girType;
+	const scalar = t === 'gboolean' || !!ctx.enumeration(t) || ctx.isPrimitive(t);
+	return p.direction === 'out' && !p.callerAllocates && scalar && (p.type.cType.match(/\*/g) ?? []).length === 1;
+}
+
+/**
+ * Virtual methods JS subclasses can override as `vfunc_<name>`: those in the
+ * class struct whose arguments and result girbind converts both ways.
+ */
+export function virtualMethods(ctx: TypeContext, owner: Owner): Func[] {
+	const struct = typeStruct(ctx, owner);
+	if (!struct) return [];
+	return (owner.members as Class).virtualMethods.filter(
+		vfunc =>
+			struct.fields.some(field => field.name === vfunc.name)
+			&& !vfunc.throws
+			&& vfunc.parameters.some(p => p.isInstance)
+			&& vfunc.parameters.every(p => p.isInstance || convertsArgument(ctx, p))
+			&& ctx.convertsResult(vfunc.returnValue.type, vfunc.returnValue.transfer)
+			&& !vfunc.returnValue.type.isArray
+	);
+}
+
+/** Lines converting the JS value `source` into the C target `assign` stores, for a virtual method's result. */
+function* resultFromJs(ctx: TypeContext, target: Parameter, source: string, assign: (value: string) => string): Lines {
+	if (target.type.girType === 'gboolean') {
+		yield assign(`${source}.ToBoolean().Value()`);
+		return;
+	}
+	const conversion = fromJs(ctx, target, source, `js_${target.name}`);
+	let next = conversion.next();
+	for (; !next.done; next = conversion.next()) yield next.value;
+	yield assign(ownedArgument(ctx, target, `js_${target.name}`, next.value));
+}
+
+/** The C function a class struct points to for a JS override, which calls `vfunc_<name>` on the instance's wrapper. */
+function* overrideFunction(ctx: TypeContext, owner: Owner, vfunc: Func): Lines {
+	const instance = vfunc.parameters.find(p => p.isInstance)!;
+	const parameters = vfunc.parameters.filter(p => !p.isInstance);
+	const rv = vfunc.returnValue;
+	const returns = rv.type.girType !== 'none';
+	const resultType = rv.type.cType || ctx.cType(rv.type);
+	const signature = [
+		`${instance.type.cType || `${owner.cName}*`} arg_self`,
+		...parameters.map(p => `${p.type.cType || ctx.cType(p.type)} arg_${p.name}`),
+	];
+
+	const toJs = parameters
+		.filter(p => p.direction === 'in')
+		.flatMap(p => [...convertToJs(ctx, p.type, p.transfer, `arg_${p.name}`, v => `args.push_back(${v});`)]);
+
+	const targets: { parameter: Parameter; assign: (value: string) => string }[] = parameters
+		.filter(p => p.direction === 'out')
+		.map(p => ({
+			parameter: { ...p, direction: 'in', type: { ...p.type, cType: p.type.cType.replace(/\*\s*$/, '').trim() } },
+			assign: value => `if (arg_${p.name}) *arg_${p.name} = ${value};`,
+		}));
+	if (returns) {
+		const result: Parameter = {
+			name: 'result',
+			type: rv.type,
+			transfer: rv.transfer,
+			nullable: rv.nullable,
+			direction: 'in',
+			isInstance: false,
+			callerAllocates: false,
+		};
+		targets.unshift({ parameter: result, assign: value => `result = (${resultType})${value};` });
+	}
+	const fromJsLines: string[] = [];
+	if (targets.length > 1) {
+		fromJsLines.push(
+			'if (!value.IsArray()) {',
+			`\tthrow Napi::TypeError::New(env, "Expected vfunc_${vfunc.name} to return an array");`,
+			'}',
+			'Napi::Array values = value.As<Napi::Array>();'
+		);
+	}
+	for (const [index, { parameter, assign }] of targets.entries()) {
+		const source = targets.length > 1 ? `js_${parameter.name}_value` : 'value';
+		if (targets.length > 1) fromJsLines.push(`Napi::Value ${source} = values.Get(${index}u);`);
+		fromJsLines.push(...resultFromJs(ctx, parameter, source, assign));
+	}
+	if (!targets.length) fromJsLines.push('(void)value;');
+
+	yield `${returns ? resultType : 'void'} override_${owner.name}_${vfunc.name}(${signature.join(', ')}) {`;
+	if (returns) yield `\t${resultType} result = {};`;
+	yield `\tgirbind::call_override(arg_self, "vfunc_${vfunc.name}", [&](Napi::Env env, std::vector<napi_value>& args) {`;
+	yield '\t\t(void)env;';
+	yield '\t\t(void)args;';
+	yield* indent(...indent(...toJs));
+	yield '\t}, [&](Napi::Env env, Napi::Value value) {';
+	yield '\t\t(void)env;';
+	yield* indent(...indent(...fromJsLines));
+	yield '\t});';
+	if (returns) yield '\treturn result;';
+	yield '}';
+	yield '';
+}
+
+/** `vfunc_<name>` on the class's prototype: the implementation of the nearest class that is not a JS subclass. */
+function* chainUp(ctx: TypeContext, owner: Owner, vfunc: Func): Lines {
+	const struct = typeStruct(ctx, owner)!;
+	const instance = vfunc.parameters.find(p => p.isInstance)!;
+	const slot = `parent_class->${vfunc.name}`;
+	yield `Napi::Value ${owner.name}_vfunc_${vfunc.name}(const Napi::CallbackInfo& info) {`;
+	yield '\tNapi::Env env = info.Env();';
+	yield `\t${owner.self}`;
+	yield `\tauto* parent_class = static_cast<${struct.cName}*>(girbind::native_class(self));`;
+	yield `\tif (!${slot}) {`;
+	yield `\t\tthrow Napi::Error::New(env, "${owner.qualified} has no implementation of ${vfunc.name}");`;
+	yield '\t}';
+	const leading = [`(${instance.type.cType || `${owner.cName}*`})self`];
+	yield* indent(...callAndReturn(ctx, { ...vfunc, cName: slot }, leading));
+	yield '}';
+	yield '';
+}
+
+/** Sets a JS subclass's overrides in the class struct, for the runtime to call when it initializes the class. */
+function* installer(ctx: TypeContext, owner: Owner): Lines {
+	const vfuncs = virtualMethods(ctx, owner);
+	if (!vfuncs.length) return;
+	yield `gboolean install_${owner.name}(gpointer type_class, const char* name) {`;
+	yield `\tauto* klass = static_cast<${typeStruct(ctx, owner)!.cName}*>(type_class);`;
+	for (const vfunc of vfuncs) {
+		yield `\tif (strcmp(name, "${vfunc.name}") == 0) {`;
+		yield `\t\tklass->${vfunc.name} = reinterpret_cast<decltype(klass->${vfunc.name})>(override_${owner.name}_${vfunc.name});`;
+		yield '\t\treturn TRUE;';
+		yield '\t}';
+	}
+	yield '\treturn FALSE;';
+	yield '}';
+	yield '';
+}
+
+/** The `get_type` function of a class, interface or boxed record, or `nullptr` to look its GType up by name. */
+function getTypeFunction(ctx: TypeContext, owner: Owner): string {
+	const getType = owner.record
+		? owner.record.binding === 'boxed'
+			? owner.record.record.getType
+			: undefined
+		: (owner.members as Class | Interface).getType;
+	if (!getType || getType === 'intern') return 'nullptr';
+	ctx.typeFunctions.add(getType);
+	return getType;
 }
 
 /** GType names of the interfaces a class implements, whose members the runtime adds to its prototype. */
@@ -512,17 +675,22 @@ function* ownerDefinition(ctx: TypeContext, owner: Owner): Lines {
 	}
 	yield '';
 	const typeName = registeredName(ctx, owner);
+	const getType = getTypeFunction(ctx, owner);
 	if (owner.isInterface) {
 		yield `Napi::Function define_${owner.name}(Napi::Env env) {`;
-		yield `\tNapi::Function cls = girbind::define_interface(env, info_${owner.name}, "${typeName}");`;
+		yield `\tNapi::Function cls = girbind::define_interface(env, info_${owner.name}, "${typeName}", ${getType});`;
 	} else {
 		const interfaces = implemented(ctx, owner).map(name => `"${name}"`);
+		const install = virtualMethods(ctx, owner).length ? `install_${owner.name}` : 'nullptr';
 		yield `Napi::Function define_${owner.name}(Napi::Env env, Napi::Function parent) {`;
-		yield `\tNapi::Function cls = girbind::define_class(env, info_${owner.name}, "${typeName}", parent, {${interfaces.join(', ')}});`;
+		yield `\tNapi::Function cls = girbind::define_class(env, info_${owner.name}, "${typeName}", parent, {${interfaces.join(', ')}}, ${getType}, ${install});`;
 	}
 	yield '\tNapi::Object prototype = cls.Get("prototype").As<Napi::Object>();';
 	for (const f of methods(owner)) {
 		yield `\tgirbind::define_method(prototype, "${methodName(f)}", ${owner.name}_${methodName(f)});`;
+	}
+	for (const vfunc of virtualMethods(ctx, owner)) {
+		yield `\tgirbind::define_method(prototype, "vfunc_${vfunc.name}", ${owner.name}_vfunc_${vfunc.name});`;
 	}
 	for (const [name] of accessors) {
 		yield `\tgirbind::define_accessor(prototype, "${name}", ${owner.name}_accessor_${name});`;
@@ -1308,7 +1476,7 @@ export interface Options {
 }
 
 /** Always-needed includes; the target library's header is added via options. */
-const BASE_INCLUDES = ['<girbind.hxx>', '<memory>', '<string>', '<vector>'];
+const BASE_INCLUDES = ['<girbind.hxx>', '<cstring>', '<memory>', '<string>', '<vector>'];
 
 function includeDirective(inc: string): string {
 	const wrapped = inc.startsWith('<') || inc.startsWith('"') ? inc : `<${inc}>`;

@@ -22,14 +22,28 @@
 
 namespace girbind {
 
-inline constexpr uint32_t abi_version = 4;
+inline constexpr uint32_t abi_version = 5;
 
 enum class Kind : uint32_t { Object, Boxed, Plain };
+
+/**
+ * A toggle reference keeping a JS subclass instance's wrapper alive while C
+ * holds other references to its object, and collectable once it does not.
+ */
+struct Toggle {
+	napi_env env;
+	/** The wrapper, held strongly while `strong`. */
+	napi_ref wrapper;
+	GToggleNotify notify;
+	bool strong = false;
+};
 
 struct Handle {
 	Kind kind;
 	GType type;
 	gpointer pointer;
+	/** For a JS subclass instance whose wrapper is attached, the toggle reference the handle holds. */
+	Toggle *toggle = nullptr;
 };
 
 inline constexpr napi_type_tag handle_tag = {0x6769726269e4d001, 0x9a3c5b7e21f04d8c};
@@ -38,7 +52,16 @@ inline void release(Handle *handle) {
 	if (!handle->pointer)
 		return;
 	switch (handle->kind) {
-		case Kind::Object: g_object_unref(handle->pointer); break;
+		case Kind::Object:
+			if (Toggle *toggle = handle->toggle) {
+				g_object_remove_toggle_ref(G_OBJECT(handle->pointer), toggle->notify, toggle);
+				napi_delete_reference(toggle->env, toggle->wrapper);
+				delete toggle;
+				handle->toggle = nullptr;
+			} else {
+				g_object_unref(handle->pointer);
+			}
+			break;
 		case Kind::Boxed: g_boxed_free(handle->type, handle->pointer); break;
 		case Kind::Plain: g_free(handle->pointer); break;
 	}
@@ -84,12 +107,14 @@ struct Runtime {
 	Napi::FunctionReference hold_loop;
 	Napi::FunctionReference release_loop;
 	Napi::FunctionReference on_abort;
+	Napi::FunctionReference construct_object;
 	Napi::Reference<Napi::Symbol> key;
 	Napi::Reference<Napi::Symbol> adopt;
 };
 
 /** The thread an addon's environment runs on, and whether that environment is still alive. */
 struct Environment {
+	napi_env env = nullptr;
 	std::thread::id thread;
 	bool alive = false;
 };
@@ -129,10 +154,11 @@ inline void init(const Napi::CallbackInfo &info) {
 		Napi::Persistent(abi.Get("holdLoop").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("releaseLoop").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("onAbort").As<Napi::Function>()),
+		Napi::Persistent(abi.Get("constructObject").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("handle").As<Napi::Symbol>()),
 		Napi::Persistent(abi.Get("adopt").As<Napi::Symbol>()),
 	});
-	environment = {std::this_thread::get_id(), true};
+	environment = {env, std::this_thread::get_id(), true};
 	napi_add_env_cleanup_hook(env, [](void *) { environment.alive = false; }, nullptr);
 }
 
@@ -191,7 +217,12 @@ using Callback = Napi::Value (*)(const Napi::CallbackInfo &);
 struct ClassInfo {
 	const char *name;
 	Callback construct;
+	/** The JS class, once defined, which `new.target` differs from when a JS subclass is constructed. */
+	mutable napi_ref cls = nullptr;
 };
+
+/** Set a JS subclass's override of the virtual method `name` in its class struct, returning whether it has one. */
+using Installer = gboolean (*)(gpointer type_class, const char *name);
 
 struct Accessor {
 	Callback get;
@@ -226,6 +257,21 @@ inline napi_value invoke_setter(napi_env env, napi_callback_info raw) {
 	return invoke(static_cast<const Accessor *>(data)->set, env, raw);
 }
 
+/** A handle to a new instance of `new.target`, from the GObject properties in the first argument, if any. */
+inline Napi::Value construct_object(const Napi::CallbackInfo &info) {
+	return runtime(info.Env()).construct_object.Call({info.NewTarget(), info[0]});
+}
+
+/** Whether a constructor argument is an object of GObject properties, which no C constructor argument can be. */
+inline bool is_properties(Napi::Value value) {
+	return value.IsObject() && !value.IsArray() && !value.IsTypedArray() && !value.IsArrayBuffer() &&
+		   !value.IsFunction() && !handle_of(value);
+}
+
+/**
+ * A class's JS constructor: adopt an existing handle, create an instance of a
+ * JS subclass or from an object of GObject properties, or call the C constructor.
+ */
 inline Napi::Value construct(const Napi::CallbackInfo &info) {
 	Napi::Env env = info.Env();
 	auto *class_info = static_cast<const ClassInfo *>(info.Data());
@@ -236,12 +282,20 @@ inline Napi::Value construct(const Napi::CallbackInfo &info) {
 	}
 	Runtime &state = runtime(env);
 	Napi::Value handle;
+	napi_value cls = nullptr;
+	if (class_info->cls)
+		napi_get_reference_value(env, class_info->cls, &cls);
+	bool subclass = cls && !info.NewTarget().StrictEquals(Napi::Value(env, cls));
+	bool properties = info.Length() == 1 && is_properties(info[0]);
 	if (info.Length() >= 2 && info[0].StrictEquals(state.adopt.Value())) {
 		handle = info[1];
-	} else if (class_info->construct) {
+	} else if (subclass || properties) {
+		handle = construct_object(info);
+	}
+	if (handle.IsEmpty() || handle.IsUndefined()) {
+		if (!class_info->construct)
+			throw Napi::TypeError::New(env, std::string(class_info->name) + " cannot be constructed directly");
 		handle = class_info->construct(info);
-	} else {
-		throw Napi::TypeError::New(env, std::string(class_info->name) + " cannot be constructed directly");
 	}
 	state.attach.Call({info.This(), handle});
 	return info.This();
@@ -263,19 +317,32 @@ inline Napi::Function new_class(Napi::Env env, const ClassInfo &info) {
 	);
 	if (status != napi_ok)
 		throw Napi::Error::New(env);
+	napi_create_reference(env, constructor, 1, &info.cls);
 	return Napi::Function(env, constructor);
+}
+
+/** A function returning the GType of a class or interface, registering it if needed. */
+inline Napi::Function gtype_function(Napi::Env env, const char *type_name, GType (*get_type)(void)) {
+	return Napi::Function::New(env, [type_name, get_type](const Napi::CallbackInfo &info) {
+		GType type = get_type ? get_type() : g_type_from_name(type_name);
+		return Napi::Number::New(info.Env(), static_cast<double>(type));
+	});
 }
 
 /**
  * Define a class extending `parent` and register it with the runtime under
  * `type_name`, adding the members of the registered `interfaces` it implements.
+ * `install` sets JS subclasses' overrides of the virtual methods its class
+ * struct declares.
  */
 inline Napi::Function define_class(
 	Napi::Env env,
 	const ClassInfo &info,
 	const char *type_name,
 	Napi::Function parent,
-	std::initializer_list<const char *> interfaces
+	std::initializer_list<const char *> interfaces,
+	GType (*get_type)(void),
+	Installer install
 ) {
 	Napi::Function cls = new_class(env, info);
 	Napi::Function set_prototype_of =
@@ -286,15 +353,68 @@ inline Napi::Function define_class(
 	uint32_t index = 0;
 	for (const char *name : interfaces)
 		names.Set(index++, Napi::String::New(env, name));
-	runtime(env).register_class.Call({Napi::String::New(env, type_name), cls, names});
+	Napi::Value installer =
+		install ? Napi::External<void>::New(env, reinterpret_cast<void *>(install)) : env.Undefined();
+	runtime(env).register_class.Call(
+		{Napi::String::New(env, type_name), cls, names, gtype_function(env, type_name, get_type), installer}
+	);
 	return cls;
 }
 
 /** Define an interface, whose prototype holds the members its implementations share, and register it. */
-inline Napi::Function define_interface(Napi::Env env, const ClassInfo &info, const char *type_name) {
+inline Napi::Function define_interface(
+	Napi::Env env,
+	const ClassInfo &info,
+	const char *type_name,
+	GType (*get_type)(void)
+) {
 	Napi::Function iface = new_class(env, info);
-	runtime(env).register_interface.Call({Napi::String::New(env, type_name), iface});
+	runtime(env).register_interface.Call(
+		{Napi::String::New(env, type_name), iface, gtype_function(env, type_name, get_type)}
+	);
 	return iface;
+}
+
+// --- subclasses ------------------------------------------------------------------
+
+/** Marks the GTypes registered for JS subclasses. */
+inline GQuark subclass_quark() {
+	return g_quark_from_static_string("girbind-subclass");
+}
+
+/** The class struct of the nearest ancestor of an instance's type that is not a JS subclass, for chaining up. */
+inline gpointer native_class(gpointer instance) {
+	GType type = G_TYPE_FROM_INSTANCE(instance);
+	while (g_type_get_qdata(type, subclass_quark()))
+		type = g_type_parent(type);
+	return g_type_class_peek(type);
+}
+
+/**
+ * Call the JS override `name` of `instance`'s wrapper with the arguments
+ * `arguments` pushes, passing what it returns to `result`. An exception is
+ * reported as uncaught, and the C caller gets zero values.
+ */
+template <typename Arguments, typename Result>
+void call_override(gpointer instance, const char *name, Arguments arguments, Result result) {
+	if (!on_main_thread()) {
+		if (environment.alive)
+			g_critical(
+				"girbind: %s was called on a thread other than the main thread; its JS override was skipped", name
+			);
+		return;
+	}
+	Napi::Env env(environment.env);
+	Napi::HandleScope scope(env);
+	try {
+		Napi::Object self = wrap_object(env, instance, false).As<Napi::Object>();
+		Napi::Function method = self.Get(name).As<Napi::Function>();
+		std::vector<napi_value> args;
+		arguments(env, args);
+		result(env, method.Call(self, args));
+	} catch (const Napi::Error &error) {
+		napi_fatal_exception(env, error.Value());
+	}
 }
 
 /** Define a non-enumerable method, like a class method in JS. */

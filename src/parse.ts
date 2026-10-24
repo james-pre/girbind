@@ -254,6 +254,8 @@ function parseFunction(node: Node, kind: FuncKind): Func | undefined {
 		isConstructor: kind.isConstructor ?? false,
 		isStatic: kind.isStatic ?? false,
 		throws: boolAttr(node, 'throws'),
+		introspectable: boolAttr(node, 'introspectable', true),
+		shadows: attr(node, 'shadows'),
 		finishName: attr(node, 'glib:finish-func'),
 	};
 }
@@ -357,6 +359,7 @@ function parseClass(node: Node, nsPrefix: string, namespace: string): Class | un
 		...info,
 		parent: parent ? qualify(parent, namespace) : undefined,
 		fundamental: boolAttr(node, 'glib:fundamental'),
+		abstract: boolAttr(node, 'abstract'),
 		...parseMembers(node),
 		properties: children(node, 'property')
 			.map(parseProperty)
@@ -368,6 +371,10 @@ function parseClass(node: Node, nsPrefix: string, namespace: string): Class | un
 			.map(implemented => attr(implemented, 'name'))
 			.filter((name): name is string => !!name)
 			.map(name => qualify(name, namespace)),
+		virtualMethods: children(node, 'virtual-method')
+			.map(method => parseFunction(method, { isMethod: true }))
+			.filter((f): f is Func => !!f),
+		typeStruct: attr(node, 'glib:type-struct'),
 	};
 }
 
@@ -641,6 +648,13 @@ function annotateCallbacks(callbacks: Map<string, Callback>, namespace: string, 
 	}
 }
 
+/** Replace a function by one shadowing it, if girbind can bind that one. */
+function annotateShadows(func: Func, group: Func[]): void {
+	if (!func.shadows || !isSupported(func)) return;
+	const shadowed = group.find(candidate => candidate.name === func.shadows);
+	if (shadowed) shadowed.isShadowed = true;
+}
+
 /** Pair an asynchronous function with the function completing it, so it is bound as a promise. */
 function annotateAsync(namespace: string, func: Func, group: Func[]): void {
 	const ready = func.parameters.find(
@@ -657,6 +671,13 @@ function annotateAsync(namespace: string, func: Func, group: Func[]): void {
 	func.finish = finish;
 }
 
+/**
+ * Callback arguments the GIR types as `gpointer` that are objects wherever the
+ * namespaces girbind binds pass them, such as the items `Gtk.CustomSorter` and
+ * `Gio.ListStore` compare.
+ */
+const objectArguments: Record<string, string[]> = { 'GLib.CompareDataFunc': ['a', 'b'] };
+
 /** Flag parameters whose handling depends on types from other namespaces in the repository. */
 function annotateParameters(repository: Repository): void {
 	const callbacks = new Map<string, Callback>();
@@ -668,6 +689,11 @@ function annotateParameters(repository: Repository): void {
 		for (const enumeration of ns.enumerations) enumerations.add(`${ns.name}.${enumeration.name}`);
 	}
 	bindRecords(repository, new Set(callbacks.keys()));
+	for (const [qualified, names] of Object.entries(objectArguments)) {
+		for (const p of callbacks.get(qualified)?.parameters ?? []) {
+			if (names.includes(p.name)) p.type = { ...p.type, girType: 'GObject.Object' };
+		}
+	}
 
 	for (const ns of repository.values()) {
 		const ctx = new TypeContext(ns, repository);
@@ -697,6 +723,9 @@ function annotateParameters(repository: Repository): void {
 
 	for (const ns of repository.values()) {
 		for (const func of functionGroups(ns).flat()) annotateCallbacks(callbacks, ns.name, func);
+	}
+	for (const ns of repository.values()) {
+		for (const group of functionGroups(ns)) for (const func of group) annotateShadows(func, group);
 	}
 	for (const ns of repository.values()) {
 		for (const group of functionGroups(ns)) for (const func of group) annotateAsync(ns.name, func, group);

@@ -25,7 +25,7 @@ for (const file of readdirSync(directory).filter(name => name.endsWith('.d.ts'))
 	const assignable = (name, base) => lines.push(`void ((value: ${alias}.${name}): ${resolve(base)} => value);`);
 
 	for (const [, name, parent] of text.matchAll(
-		/^export declare class (\w+)<S extends object = \{\}> extends ([\w.]+)</gm
+		/^export declare (?:abstract )?class (\w+)<S extends object = \{\}> extends ([\w.]+)</gm
 	)) {
 		assignable(name, parent);
 	}

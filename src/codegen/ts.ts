@@ -29,6 +29,7 @@ import {
 	properties,
 	recordOwner,
 	statics,
+	virtualMethods,
 	zeroConstructible,
 } from './cxx.js';
 
@@ -293,10 +294,11 @@ function* members(
 	signatures = new Map<string, string[]>()
 ): Lines {
 	if (owner.primary) yield `\tconstructor(${params(ctx, owner.primary)});`;
+	if (!owner.record) yield '\tconstructor(properties?: Record<string, unknown>);';
 	else if (zeroConstructible(owner)) yield '\tconstructor();';
 	// `protected` (not `private`) so subclasses can still `extends` a return-only
-	// base; the runtime constructor throws for these classes regardless.
-	else yield '\tprotected constructor();';
+	// base; the runtime constructor throws for these records regardless.
+	else if (!owner.primary) yield '\tprotected constructor();';
 	yield* staticMembers(ctx, owner, 'static ');
 	yield* instanceMembers(ctx, owner, inherited, false, signatures);
 }
@@ -368,8 +370,13 @@ function* implementedDecl(ctx: TypeContext, cls: Class): Lines {
 function* classDecl(ctx: TypeContext, cls: Class): Lines {
 	const parent = ctx.classReference(ctx.boundParent(cls).qualified);
 	yield* implementedDecl(ctx, cls);
-	yield `export declare class ${cls.name}<S extends object = {}> extends ${parent}<${signalMap(ctx, classSignals(ctx, cls))} & S> {`;
-	yield* members(ctx, classOwner(ctx, cls), ancestorMembers(ctx, cls.parent), inheritedSignatures(ctx, cls));
+	const abstract = cls.abstract ? 'abstract ' : '';
+	yield `export declare ${abstract}class ${cls.name}<S extends object = {}> extends ${parent}<${signalMap(ctx, classSignals(ctx, cls))} & S> {`;
+	const owner = classOwner(ctx, cls);
+	yield* members(ctx, owner, ancestorMembers(ctx, cls.parent), inheritedSignatures(ctx, cls));
+	for (const vfunc of virtualMethods(ctx, owner)) {
+		yield `\tvfunc_${vfunc.name}(${params(ctx, vfunc)}): ${ret(ctx, vfunc)};`;
+	}
 	yield '}';
 	yield '';
 }
@@ -395,6 +402,7 @@ function* interfaceDecl(ctx: TypeContext, iface: Interface): Lines {
 	yield '}';
 	yield `export declare const ${iface.name}: {`;
 	yield `\treadonly prototype: ${iface.name};`;
+	yield '\treadonly $gtype: number;';
 	yield `\t[Symbol.hasInstance](value: unknown): value is ${iface.name};`;
 	yield* staticMembers(ctx, owner, '');
 	yield '};';

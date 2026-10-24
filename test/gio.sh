@@ -47,6 +47,6 @@ EOF
 npx tsc -p "$out/tsconfig.json"
 
 echo "==> Running usage test"
-node test/gio.js "$out/native/gio.js"
+node --expose-gc test/gio.js "$out/native/gio.js"
 
 echo "PASS"
