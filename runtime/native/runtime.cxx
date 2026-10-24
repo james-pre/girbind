@@ -100,6 +100,12 @@ Napi::Value is_a(const Napi::CallbackInfo &info) {
 	return Napi::Boolean::New(info.Env(), result);
 }
 
+/** `dispose(handle)`: run the object's dispose, which drops its references to other objects. */
+Napi::Value dispose(const Napi::CallbackInfo &info) {
+	g_object_run_dispose(expect_object(info));
+	return info.Env().Undefined();
+}
+
 /** Drop a handle's reference now instead of when it is collected. */
 Napi::Value release(const Napi::CallbackInfo &info) {
 	girbind::release(expect_handle(info));
@@ -399,6 +405,8 @@ void marshal(GClosure *closure, GValue *return_value, guint count, const GValue 
 			args.push_back(girbind::value_to_js(env, &params[i]));
 		napi_value function, receiver, result;
 		napi_get_reference_value(env, js->function, &function);
+		if (!function)
+			return;
 		napi_get_undefined(env, &receiver);
 		if (napi_call_function(env, receiver, function, args.size(), args.data(), &result) != napi_ok) {
 			napi_value error;
@@ -429,7 +437,7 @@ Napi::Value connect(const Napi::CallbackInfo &info) {
 
 	auto *js = reinterpret_cast<JsClosure *>(g_closure_new_simple(sizeof(JsClosure), nullptr));
 	js->env = env;
-	napi_create_reference(env, handler, 1, &js->function);
+	napi_create_reference(env, handler, 0, &js->function);
 	g_closure_set_marshal(&js->closure, marshal);
 	g_closure_add_finalize_notifier(&js->closure, nullptr, finalize_closure);
 	gulong id = g_signal_connect_closure_by_id(object, signal_id, detail, &js->closure, after);
@@ -634,14 +642,16 @@ void toggle_wrapper(gpointer data, GObject *, gboolean is_last_ref) {
 }
 
 /**
- * `toggle(handle, wrapper)`: if the handle is to a JS subclass instance, hold it
- * through a toggle reference that keeps `wrapper` alive while C also holds it.
+ * `toggle(handle, wrapper, always)`: if the handle is to a JS subclass instance,
+ * or `always`, hold its object through a toggle reference that keeps `wrapper`
+ * alive while C also holds the object, and lets it be collected otherwise.
  */
 Napi::Value toggle(const Napi::CallbackInfo &info) {
 	Napi::Env env = info.Env();
 	girbind::Handle *handle = expect_handle(info);
+	bool always = info[2].ToBoolean().Value();
 	if (handle->kind != girbind::Kind::Object || handle->toggle ||
-		!g_type_get_qdata(G_OBJECT_TYPE(handle->pointer), girbind::subclass_quark()))
+		(!always && !g_type_get_qdata(G_OBJECT_TYPE(handle->pointer), girbind::subclass_quark())))
 		return env.Undefined();
 	auto *toggle = new girbind::Toggle{env, nullptr, toggle_wrapper};
 	napi_create_reference(env, info[1], 0, &toggle->wrapper);
@@ -666,6 +676,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 	exports.Set("interfaces", Napi::Function::New(env, interfaces));
 	exports.Set("isA", Napi::Function::New(env, is_a));
 	exports.Set("release", Napi::Function::New(env, release));
+	exports.Set("dispose", Napi::Function::New(env, dispose));
 	exports.Set("watchFinalization", Napi::Function::New(env, watch_finalization));
 	exports.Set("finalized", Napi::Function::New(env, finalized));
 	exports.Set("holdLoop", Napi::Function::New(env, hold_loop));

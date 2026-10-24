@@ -14,6 +14,8 @@ export interface Native {
 	/** Whether the handle's value is an instance of the GType named `typeName`. */
 	isA(handle: Handle, typeName: string): boolean;
 	release(handle: Handle): void;
+	/** Run the object's dispose. */
+	dispose(handle: Handle): void;
 	watchFinalization(handle: Handle): void;
 	/** Number of watched objects finalized so far. */
 	finalized(): number;
@@ -22,7 +24,7 @@ export interface Native {
 	/** Keep the event loop alive until a matching {@link Native.releaseLoop}. */
 	holdLoop(): void;
 	releaseLoop(): void;
-	/** Connect a JS handler to a GObject signal, returning the handler ID. */
+	/** Connect a JS handler to a GObject signal, returning the handler ID; the handler is only weakly referenced. */
 	connect(handle: Handle, signal: string, handler: (...args: never[]) => unknown, after: boolean): number;
 	disconnect(handle: Handle, id: number): void;
 	/** Call `callback` once from a GLib timeout source after `delay` milliseconds. */
@@ -36,8 +38,11 @@ export interface Native {
 	typeFromName(name: string): number;
 	/** A handle to a new instance of `type` with the given GObject properties. */
 	newObject(type: number, properties: unknown): Handle;
-	/** Hold a JS subclass instance through a toggle reference keeping `wrapper` alive while C also holds it. */
-	toggle(handle: Handle, wrapper: object): void;
+	/**
+	 * Hold a JS subclass instance's object, or any object if `always`, through a
+	 * toggle reference keeping `wrapper` alive while C also holds the object.
+	 */
+	toggle(handle: Handle, wrapper: object, always?: boolean): void;
 }
 
 const require = createRequire(import.meta.url);

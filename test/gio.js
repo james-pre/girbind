@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { GObject, internal } from 'girbind';
+import { connect, GObject, internal } from 'girbind';
 
 const addonPath = process.argv[2];
 assert.ok(addonPath, 'usage: node test/gio.js <path-to-gio.js>');
@@ -194,6 +194,47 @@ assert.throws(() => new App(5), TypeError, 'subclass constructors take an object
 
 assert.equal(new Gio.SimpleAction({ name: 'save' }).getName(), 'save', 'classes construct from GObject properties');
 assert.throws(() => new Gio.InputStream({}), /abstract/, 'abstract classes are constructed only through subclasses');
+
+// --- signal handlers --------------------------------------------------------------
+const beforeLeak = internal.finalized();
+(() => {
+	const action = new Gio.SimpleAction({ name: 'leak' });
+	internal.watchFinalization(action);
+	connect(action, 'activate', () => action.getName());
+})();
+await collect(() => internal.finalized() > beforeLeak);
+assert.equal(internal.finalized() - beforeLeak, 1, 'a handler capturing its own target does not keep it alive');
+
+const activations = [];
+(() => {
+	const action = new Gio.SimpleAction({ name: 'kept' });
+	connect(action, 'activate', self => activations.push(self.getName()));
+	group.addAction(action);
+})();
+await collect();
+group.activateAction('kept', null);
+assert.deepEqual(activations, ['kept'], 'a handler lives while only C holds its target');
+
+const held = new Gio.SimpleAction({ name: 'held' });
+connect(held, 'activate', self => activations.push(self.getName()));
+await collect();
+held.activate(null);
+assert.deepEqual(activations, ['kept', 'held'], 'a handler lives while only JS holds its target');
+
+const beforeDispose = internal.finalized();
+(() => {
+	using owner = new Gio.ListStore(Item.$gtype);
+	internal.watchFinalization(owner);
+	const owned = new Item('owned');
+	connect(owned, 'notify', () => owner.getNItems());
+	owner.append(owned);
+})();
+await collect(() => internal.finalized() > beforeDispose);
+assert.equal(
+	internal.finalized() - beforeDispose,
+	1,
+	'disposing (here through `using`) breaks a cycle through C: an owned object whose handler captures its owner'
+);
 
 rmSync(directory, { recursive: true });
 console.log('gio.js: all assertions passed');

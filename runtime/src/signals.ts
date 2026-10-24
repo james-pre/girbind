@@ -20,6 +20,13 @@ export interface ConnectOptions {
 	after?: boolean;
 }
 
+/**
+ * Connected handlers, by target and handler ID. A target's wrapper keeps its
+ * handlers alive, and lives while C holds its object, so a handler capturing
+ * its own target is collected with it once only JS holds the object.
+ */
+const handlers = new WeakMap<object, Map<number, (...args: never[]) => unknown>>();
+
 /** Abort listeners of handlers connected with `ConnectOptions.signal`, by target and handler ID. */
 const abortListeners = new WeakMap<object, Map<number, { signal: AbortSignal; listener: () => void }>>();
 
@@ -53,7 +60,14 @@ export function connect(
 	options: ConnectOptions = {}
 ): number {
 	if (options.signal?.aborted) return 0;
+	native.toggle(handleOf(target), target, true);
 	const id = native.connect(handleOf(target), signal, handler, options.after ?? false);
+	let connected = handlers.get(target);
+	if (!connected) {
+		connected = new Map();
+		handlers.set(target, connected);
+	}
+	connected.set(id, handler);
 	if (!options.signal) return id;
 
 	const listener = () => disconnect(target, id);
@@ -70,6 +84,7 @@ export function connect(
 /** Disconnect a handler connected with {@link connect}. */
 export function disconnect(target: Object, id: number): void {
 	native.disconnect(handleOf(target), id);
+	handlers.get(target)?.delete(id);
 	const listeners = abortListeners.get(target);
 	const entry = listeners?.get(id);
 	if (!entry) return;

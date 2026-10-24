@@ -1,4 +1,5 @@
-import { adopt, attach, constructObject, type Handle, register } from './internal.js';
+import { adopt, attach, constructObject, type Handle, handle, register } from './internal.js';
+import native from './native.js';
 import { signals } from './signals.js';
 
 /**
@@ -18,6 +19,21 @@ export class Object<Signals extends object = {}> {
 	constructor(marker: typeof adopt, value: Handle);
 	constructor(...args: unknown[]) {
 		attach(this, args[0] === adopt ? (args[1] as Handle) : constructObject(new.target, args[0])!);
+	}
+
+	/**
+	 * Run the object's dispose, so it drops its references to other objects: a
+	 * GTK widget releases its children, event controllers and signal handlers.
+	 * Use it when removing an object whose wrapper is reachable from a handler on
+	 * an object it owns, such as a widget whose controller's handler captures the
+	 * widget, a cycle through C that garbage collection cannot see.
+	 */
+	dispose(): void {
+		native.dispose((this as unknown as Record<typeof handle, Handle>)[handle]);
+	}
+
+	[Symbol.dispose](): void {
+		this.dispose();
 	}
 }
 
