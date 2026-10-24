@@ -27,6 +27,14 @@ export interface TypeRef {
 	isArray: boolean;
 	/** For arrays, the element's GIR type name (e.g. `utf8`, `Flatpak.Ref`). */
 	elementType?: string;
+	/** For arrays, the element's C type, e.g. `GdkRGBA` for an array of structs. */
+	elementCType?: string;
+	/** For C arrays, the index (excluding `self`) of the parameter holding the length. */
+	length?: number;
+	/** For C arrays, whether a zero (or `NULL`) element marks the end. */
+	zeroTerminated?: boolean;
+	/** For C arrays, the number of elements when it is fixed. */
+	fixedSize?: number;
 }
 
 export interface Parameter {
@@ -38,8 +46,12 @@ export interface Parameter {
 	/** True for the implicit `self` of an instance method. */
 	isInstance: boolean;
 	callerAllocates: boolean;
-	/** GIR `scope` attribute, present on callback parameters (`call`/`async`/`notified`). */
+	/** GIR `scope` attribute, present on callback parameters (`call`/`async`/`notified`/`forever`). */
 	scope?: string;
+	/** For a callback, the index (excluding `self`) of the parameter carrying its user data. */
+	closure?: number;
+	/** For a callback, the index (excluding `self`) of the parameter taking its destroy notify. */
+	destroy?: number;
 	/** True when the type names a `<callback>` of any loaded namespace, set by `loadRepository`. */
 	isCallback?: boolean;
 	/** True for an out parameter filling a record that cannot be wrapped, set by `loadRepository`. */
@@ -48,6 +60,12 @@ export interface Parameter {
 	fillsRecord?: boolean;
 	/** True for an inout parameter that is not a number, boolean or enum, set by `loadRepository`. */
 	isComplexInout?: boolean;
+	/** True for an array girbind cannot convert, set by `loadRepository`. */
+	isOpaqueArray?: boolean;
+	/** True for a callback girbind can call JS through, set by `loadRepository`. */
+	isBindableCallback?: boolean;
+	/** True for a length, user data or destroy notify parameter that girbind fills in itself, set by `loadRepository`. */
+	isHidden?: boolean;
 }
 
 export interface ReturnValue {
@@ -56,6 +74,8 @@ export interface ReturnValue {
 	nullable: boolean;
 	/** True when the type names a `<callback>` of any loaded namespace, set by `loadRepository`. */
 	isCallback?: boolean;
+	/** True for an array girbind cannot convert, set by `loadRepository`. */
+	isOpaqueArray?: boolean;
 }
 
 export interface Func {
@@ -70,6 +90,21 @@ export interface Func {
 	isStatic: boolean;
 	/** True when the function takes a trailing `GError**` (`throws="1"`). */
 	throws: boolean;
+	/** Name of the function completing this asynchronous one, from `glib:finish-func`. */
+	finishName?: string;
+	/** The function completing this asynchronous one, which it is bound as a promise of, set by `loadRepository`. */
+	finish?: Func;
+}
+
+/** A `<callback>` type: the signature of a C function pointer. */
+export interface Callback {
+	name: string;
+	cName: string;
+	parameters: Parameter[];
+	returnValue: ReturnValue;
+	throws: boolean;
+	/** True when JS functions can be passed for it, set by `loadRepository`. */
+	isBindable?: boolean;
 }
 
 export interface Property {
@@ -193,8 +228,7 @@ export interface Namespace {
 	interfaces: Interface[];
 	records: Struct[];
 	unions: TypeInfo[];
-	/** Names of `<callback>` types. */
-	callbacks: string[];
+	callbacks: Callback[];
 	functions: Func[];
 	enumerations: Enumeration[];
 }

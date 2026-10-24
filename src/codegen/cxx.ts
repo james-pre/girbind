@@ -27,8 +27,8 @@ import type {
 	TypeRef,
 } from '../ir.js';
 import { camelCase, factoryName, functionExportNames, isSupported, methodName, primaryConstructor } from '../names.js';
-import type { Repository } from '../parse.js';
-import { type RecordType, shortName, TypeContext } from '../types.js';
+import { callbackData, lengthIndices, type Repository } from '../parse.js';
+import { qualifyType, type RecordType, shortName, TypeContext } from '../types.js';
 
 type Lines = Generator<string, void, void>;
 
@@ -203,9 +203,7 @@ function errorParam(func: Func): string | undefined {
 /** Lines that throw when `err` is set after a C call. */
 function* errorCheck(err: string): Lines {
 	yield `if (${err}) {`;
-	yield `\tNapi::Error js_error = Napi::Error::New(env, ${err}->message);`;
-	yield `\tg_error_free(${err});`;
-	yield '\tthrow js_error;';
+	yield `\tthrow girbind::from_gerror(env, ${err});`;
 	yield '}';
 }
 
@@ -256,11 +254,13 @@ function* construct(ctx: TypeContext, owner: Owner): Lines {
 		return;
 	}
 	const cppParams: string[] = [];
-	yield* indent(...emitParams(ctx, func, [], cppParams));
+	const args = yield* indented(emitParams(ctx, func, [], cppParams));
 	const err = errorParam(func);
 	if (err) yield `\tGError* ${err} = NULL;`;
+	yield* indent(...args.beforeCall);
 	yield `\t${callExpr(`gpointer handle = (gpointer)${func.cName}`, cppParams, err)}`;
 	if (err) yield* indent(...errorCheck(err));
+	yield* indent(...args.afterCall);
 	yield '\tif (!handle) {';
 	yield `\t\tthrow Napi::Error::New(env, "${func.cName} returned NULL");`;
 	yield '\t}';
@@ -272,12 +272,24 @@ function* construct(ctx: TypeContext, owner: Owner): Lines {
 	yield '';
 }
 
-function* factory(ctx: TypeContext, owner: Owner, func: Func): Lines {
-	yield `Napi::Value ${owner.name}_factory_${factoryName(func)}(const Napi::CallbackInfo& info) {`;
+/** A wrapper's body: the call, or for an asynchronous function, a promise of its finish function's result. */
+function* body(ctx: TypeContext, func: Func, leading: string[], name: string, returnsSelf = false): Lines {
+	if (func.finish) yield* indent(...asyncCall(ctx, func, leading, name));
+	else yield* indent(...callAndReturn(ctx, func, leading, returnsSelf));
+}
+
+/** A wrapper named `name` for `func`, preceded by its ready callback if it is asynchronous. */
+function* wrapper(ctx: TypeContext, func: Func, name: string, lines: (name: string) => Lines): Lines {
+	if (func.finish) yield* readyFunction(ctx, func, name);
+	yield `Napi::Value ${name}(const Napi::CallbackInfo& info) {`;
 	yield '\tNapi::Env env = info.Env();';
-	yield* indent(...callAndReturn(ctx, func, []));
+	yield* lines(name);
 	yield '}';
 	yield '';
+}
+
+function* factory(ctx: TypeContext, owner: Owner, func: Func): Lines {
+	yield* wrapper(ctx, func, `${owner.name}_factory_${factoryName(func)}`, name => body(ctx, func, [], name));
 }
 
 /** Whether a method returns its own instance pointer, as builder-style record methods such as `init` do. */
@@ -308,6 +320,7 @@ function ownedArgument(ctx: TypeContext, p: Parameter, local: string, expression
 	const t = p.type.girType;
 	const cast = p.type.cType ? `(${p.type.cType})` : '';
 	if (ctx.objectType(t)) return `${cast}(${local} ? g_object_ref(${local}) : NULL)`;
+	if (t === 'GLib.Bytes') return `${cast}(${local} ? g_bytes_ref(${local}) : NULL)`;
 	const record = ctx.recordType(t);
 	if (record && !isScalarCType(p.type.cType)) return `${cast}${ownedRecord(ctx, record, local)}`;
 	const isString = t === 'utf8' || t === 'filename';
@@ -319,28 +332,18 @@ function ownedArgument(ctx: TypeContext, p: Parameter, local: string, expression
 }
 
 function* method(ctx: TypeContext, owner: Owner, func: Func): Lines {
-	yield `Napi::Value ${owner.name}_${methodName(func)}(const Napi::CallbackInfo& info) {`;
-	yield '\tNapi::Env env = info.Env();';
-	yield `\t${owner.self}`;
-	yield* indent(...callAndReturn(ctx, func, [selfArgument(ctx, owner, func)], mayReturnSelf(ctx, owner, func)));
-	yield '}';
-	yield '';
+	yield* wrapper(ctx, func, `${owner.name}_${methodName(func)}`, function* (name) {
+		yield `\t${owner.self}`;
+		yield* body(ctx, func, [selfArgument(ctx, owner, func)], name, mayReturnSelf(ctx, owner, func));
+	});
 }
 
 function* staticMethod(ctx: TypeContext, owner: Owner, func: Func): Lines {
-	yield `Napi::Value ${owner.name}_static_${methodName(func)}(const Napi::CallbackInfo& info) {`;
-	yield '\tNapi::Env env = info.Env();';
-	yield* indent(...callAndReturn(ctx, func, []));
-	yield '}';
-	yield '';
+	yield* wrapper(ctx, func, `${owner.name}_static_${methodName(func)}`, name => body(ctx, func, [], name));
 }
 
 function* standalone(ctx: TypeContext, func: Func): Lines {
-	yield `Napi::Value Wrap_${func.cName}(const Napi::CallbackInfo& info) {`;
-	yield '\tNapi::Env env = info.Env();';
-	yield* indent(...callAndReturn(ctx, func, []));
-	yield '}';
-	yield '';
+	yield* wrapper(ctx, func, `Wrap_${func.cName}`, name => body(ctx, func, [], name));
 }
 
 /** Find the instance method implementing a property accessor, searching this namespace's hierarchy from `cls`. */
@@ -548,16 +551,47 @@ function numberAccessor(girType: string): string {
 	return 'Int32Value()';
 }
 
+/** What a wrapper passes for parameters JS does not supply directly. */
+interface CallOptions {
+	/** The ready callback of an asynchronous function, whose wrapper returns a promise. */
+	ready?: string;
+	/** C expressions for parameters the caller supplies, such as a finish function's async result. */
+	overrides?: Map<Parameter, string>;
+}
+
+/** A function's converted arguments. */
+interface Arguments {
+	outParams: OutParam[];
+	/** Statements between converting the arguments and the C call. */
+	beforeCall: string[];
+	/** Statements after the C call returns and its error is checked. */
+	afterCall: string[];
+}
+
+/** The C expression for the number of elements of an array return value or parameter, if a parameter holds it. */
+function lengthOf(func: Func, type: TypeRef): string | undefined {
+	if (type.length === undefined) return undefined;
+	const holder = func.parameters.filter(p => !p.isInstance)[type.length];
+	return holder.direction === 'in' ? `arg_${holder.name}` : `out_${holder.name}`;
+}
+
 /**
  * Emit parameter extraction, the C call (with error handling) and the JS return
  * for a function. `leading` is prepended to the call args (`self` for methods).
  */
-function* callAndReturn(ctx: TypeContext, func: Func, leading: string[], mayReturnSelf = false): Lines {
+function* callAndReturn(
+	ctx: TypeContext,
+	func: Func,
+	leading: string[],
+	mayReturnSelf = false,
+	options: CallOptions = {}
+): Lines {
 	const cppParams: string[] = [];
-	const outParams = yield* emitParams(ctx, func, leading, cppParams);
+	const args = yield* emitParams(ctx, func, leading, cppParams, options);
 
 	const err = errorParam(func);
 	if (err) yield `GError* ${err} = NULL;`;
+	yield* args.beforeCall;
 
 	const rv = func.returnValue;
 	let resultVar: string | null = null;
@@ -569,29 +603,128 @@ function* callAndReturn(ctx: TypeContext, func: Func, leading: string[], mayRetu
 	}
 
 	if (err) yield* errorCheck(err);
-	if (mayReturnSelf && resultVar && !outParams.length) {
+	yield* args.afterCall;
+	if (mayReturnSelf && resultVar && !args.outParams.length) {
 		yield `if ((gconstpointer)${resultVar} == (gconstpointer)self) return info.This();`;
 	}
-	yield* emitResult(ctx, func, resultVar, outParams);
+	yield* emitResult(ctx, func, resultVar, args.outParams);
 }
+
+/** The body of an asynchronous function's wrapper: start the call and return the promise its ready callback settles. */
+function* asyncCall(ctx: TypeContext, func: Func, leading: string[], name: string): Lines {
+	yield 'std::unique_ptr<girbind::AsyncCall> call(new girbind::AsyncCall(env));';
+	const cppParams: string[] = [];
+	const args = yield* emitParams(ctx, func, leading, cppParams, { ready: `${name}_ready` });
+	yield* args.beforeCall;
+	yield 'girbind::AsyncCall* pending = call.release();';
+	yield 'Napi::Promise promise = pending->deferred.Promise();';
+	yield callExpr(func.cName, cppParams, undefined);
+	yield 'return promise;';
+}
+
+/** The ready callback of an asynchronous function's wrapper, which settles its promise with the finish function's result. */
+function* readyFunction(ctx: TypeContext, func: Func, name: string): Lines {
+	const finish = func.finish!;
+	const instance = finish.parameters.find(p => p.isInstance);
+	const result = finish.parameters.find(p => !p.isInstance && p.direction !== 'out' && !isErrorParam(p))!;
+	const leading = instance ? [`(${instance.type.cType || 'gpointer'})source_object`] : [];
+	const overrides = new Map([[result, `(${result.type.cType || 'GAsyncResult*'})res`]]);
+	yield `void ${name}_ready(GObject* source_object, GAsyncResult* res, gpointer data) {`;
+	if (!instance) yield '\t(void)source_object;';
+	yield '\tgirbind::settle(static_cast<girbind::AsyncCall*>(data), [&](Napi::Env env) -> Napi::Value {';
+	yield* indent(...indent(...callAndReturn(ctx, finish, leading, false, { overrides })));
+	yield '\t});';
+	yield '}';
+	yield '';
+}
+
+/** The C function GLib calls for a callback type, which calls the JS function in its user data. */
+function trampolineName(qualified: string): string {
+	return `trampoline_${qualified.replace(/\./g, '_')}`;
+}
+
+function* trampoline(ctx: TypeContext, qualified: string): Lines {
+	const callback = ctx.anyCallback(qualified)!;
+	const namespace = qualified.slice(0, qualified.lastIndexOf('.'));
+	const data = callbackData(callback)!;
+	const lengths = lengthIndices(callback.parameters);
+	const rv = { ...callback.returnValue, type: qualifyType(callback.returnValue.type, namespace) };
+	const returns = rv.type.girType !== 'none';
+	const resultType = rv.type.cType || ctx.cType(rv.type);
+	const parameters = callback.parameters.map(p => ({ ...p, type: qualifyType(p.type, namespace) }));
+	const signature = parameters.map(p => `${p.type.cType || ctx.cType(p.type)} arg_${p.name}`);
+
+	const body = ['std::vector<napi_value> args;'];
+	for (const [i, p] of parameters.entries()) {
+		if (i === data || lengths.has(i)) continue;
+		const length = p.type.length === undefined ? undefined : `arg_${parameters[p.type.length].name}`;
+		body.push(...convertToJs(ctx, p.type, p.transfer, `arg_${p.name}`, v => `args.push_back(${v});`, length));
+	}
+	body.push('Napi::Value value = callback->call(args);');
+	if (rv.type.girType === 'gboolean') {
+		body.push('if (!value.IsEmpty()) result = value.ToBoolean().Value();');
+	} else if (returns) {
+		const result: Parameter = {
+			name: 'result',
+			type: rv.type,
+			transfer: rv.transfer,
+			nullable: rv.nullable,
+			direction: 'in',
+			isInstance: false,
+			callerAllocates: false,
+		};
+		body.push('if (value.IsEmpty()) return;');
+		const conversion = fromJs(ctx, result, 'value', 'js_result');
+		let next = conversion.next();
+		for (; !next.done; next = conversion.next()) body.push(next.value);
+		body.push(`result = (${resultType})${ownedArgument(ctx, result, 'js_result', next.value)};`);
+	}
+
+	yield `${returns ? resultType : 'void'} ${trampolineName(qualified)}(${signature.join(', ')}) {`;
+	yield `\tauto* callback = static_cast<girbind::JsCallback*>(arg_${parameters[data].name});`;
+	if (returns) yield `\t${resultType} result = {};`;
+	yield '\tgirbind::invoke(callback, [&](Napi::Env env) {';
+	yield* indent(...indent(...body));
+	yield '\t});';
+	if (returns) yield '\treturn result;';
+	yield '}';
+	yield '';
+}
+
+/** Turns a JS cancellable argument, a Gio.Cancellable or an AbortSignal, into a GCancellable. */
+const cancellableArgument = [
+	'GCancellable* cancellable_argument(Napi::Value value, girbind::AsyncCall* call, bool nullable) {',
+	'\tif (value.IsNull() || value.IsUndefined() || girbind::handle_of(value)) {',
+	'\t\treturn girbind::unwrap_object<GCancellable>(value, g_cancellable_get_type(), "Gio.Cancellable", nullable);',
+	'\t}',
+	'\tGCancellable* cancellable = g_cancellable_new();',
+	'\tgirbind::watch_abort(call, value, G_OBJECT(cancellable), [](GObject* object) {',
+	'\t\tg_cancellable_cancel(G_CANCELLABLE(object));',
+	'\t});',
+	'\treturn cancellable;',
+	'}',
+	'',
+];
 
 /**
  * Convert a C value `varName` (of GIR type `type`, with `transfer` ownership)
  * into a `Napi::Value`, yielding an expression via `emit(expr)`. Shared by
  * function returns, property getters and array elements. Does not itself emit a
- * `return`; the caller decides what to do with the produced value.
+ * `return`; the caller decides what to do with the produced value. `length` is
+ * the C expression for the number of elements of a C array.
  */
 function* convertToJs(
 	ctx: TypeContext,
 	type: TypeRef,
 	transfer: ReturnValue['transfer'],
 	varName: string,
-	emit: (valueExpr: string) => string
+	emit: (valueExpr: string) => string,
+	length?: string
 ): Lines {
 	const t = type.girType;
 
 	if (type.isArray) {
-		yield* convertArrayToJs(ctx, type, transfer, varName, emit);
+		yield* convertArrayToJs(ctx, type, transfer, varName, emit, length);
 		return;
 	}
 	if ((t === 'gboolean' || ctx.enumeration(t) || ctx.isPrimitive(t)) && type.cType.includes('*')) {
@@ -652,13 +785,18 @@ function* bytesToJs(varName: string, transfer: ReturnValue['transfer'], emit: (e
 	yield emit(`${varName}_buf`);
 }
 
-/** Convert a C array (`char**` / `GPtrArray*`) to a JS array. */
+/**
+ * Convert a C array to a JS array, or a byte array to a `Buffer`: a `char**`, a
+ * `GPtrArray*`, or a C array of `length` elements, a fixed size, or ending at a
+ * zero element.
+ */
 function* convertArrayToJs(
 	ctx: TypeContext,
 	type: TypeRef,
 	transfer: ReturnValue['transfer'],
 	varName: string,
-	emit: (e: string) => string
+	emit: (e: string) => string,
+	length?: string
 ): Lines {
 	const kind = ctx.arrayKind(type);
 
@@ -697,8 +835,36 @@ function* convertArrayToJs(
 		return;
 	}
 
-	yield `// TODO: convert array return of element type "${type.elementType ?? '?'}"`;
-	yield emit('env.Null()');
+	const element = kind === 'cArray' ? ctx.arrayElement(type) : undefined;
+	if (!element) {
+		yield `// TODO: convert array of element type "${type.elementType ?? '?'}"`;
+		yield emit('env.Null()');
+		return;
+	}
+	const count = length ? `static_cast<gsize>(${length})` : type.fixedSize?.toString();
+	yield `gsize ${varName}_count = ${varName} ? ${count ?? '0'} : 0;`;
+	if (!count) yield `while (${varName} && ${varName}[${varName}_count]) ${varName}_count++;`;
+	if (element === 'bytes') {
+		yield `Napi::Value ${varName}_js = Napi::Buffer<uint8_t>::Copy(env, reinterpret_cast<const uint8_t*>(${varName}), ${varName}_count);`;
+	} else {
+		const item = ctx.arrayElementType(type);
+		const itemTransfer = transfer === 'full' ? 'full' : 'none';
+		yield `Napi::Array ${varName}_js = Napi::Array::New(env, ${varName}_count);`;
+		yield `for (gsize i = 0; i < ${varName}_count; i++) {`;
+		yield `\tauto ${varName}_item = ${varName}[i];`;
+		yield* indent(
+			...convertToJs(
+				ctx,
+				item,
+				itemTransfer,
+				`${varName}_item`,
+				v => `${varName}_js.Set(static_cast<uint32_t>(i), ${v});`
+			)
+		);
+		yield '}';
+	}
+	if (transfer !== 'none') yield `g_free((gpointer)${varName});`;
+	yield emit(`${varName}_js`);
 }
 
 /** An output parameter whose value is collected into the function result. */
@@ -706,14 +872,23 @@ interface OutParam {
 	name: string;
 	type: TypeRef;
 	transfer: ReturnValue['transfer'];
+	/** The C expression for the number of elements of a C array. */
+	length?: string;
 }
 
 /**
  * Declare `local` and fill it from the JS value `source` for an input
  * parameter, returning the expression to pass to C. Throws a TypeError (as a
- * C++ exception) on a type mismatch.
+ * C++ exception) on a type mismatch. Strings and arrays are kept in `storage`,
+ * an `AsyncCall`, when C may read them after the call returns.
  */
-function* fromJs(ctx: TypeContext, p: Parameter, source: string, local: string): Generator<string, string, void> {
+function* fromJs(
+	ctx: TypeContext,
+	p: Parameter,
+	source: string,
+	local: string,
+	storage?: string
+): Generator<string, string, void> {
 	const t = p.type.girType;
 	function* expect(check: string, expected: string): Lines {
 		yield `if (!${source}.${check}) {`;
@@ -721,6 +896,18 @@ function* fromJs(ctx: TypeContext, p: Parameter, source: string, local: string):
 		yield '}';
 	}
 	const absent = `${source}.IsNull() || ${source}.IsUndefined()`;
+	const declare = (type: string, name: string) =>
+		storage ? `${type}& ${name} = ${storage}->store<${type}>();` : `${type} ${name};`;
+	/** Lines run only when the value is present, if the parameter is nullable. */
+	function* present(lines: Iterable<string>): Lines {
+		if (!p.nullable) {
+			yield* lines;
+			return;
+		}
+		yield `if (!(${absent})) {`;
+		yield* indent(...lines);
+		yield '}';
+	}
 
 	// A string array may appear as an <array> or as utf8 with a `char**` c:type.
 	const isStrvParam =
@@ -728,41 +915,46 @@ function* fromJs(ctx: TypeContext, p: Parameter, source: string, local: string):
 		|| ((t === 'utf8' || t === 'filename') && /\*\s*\*/.test(p.type.cType));
 
 	if (isStrvParam) {
-		// JS string[] -> NULL-terminated char**. Backing storage lives for the
-		// duration of the wrapper call, which is all the C call needs.
-		yield* expect('IsArray()', 'string[]');
-		yield `Napi::Array ${local}_arr = ${source}.As<Napi::Array>();`;
-		yield `std::vector<std::string> ${local}_store;`;
-		yield `std::vector<const char*> ${local}_vec;`;
-		yield `for (uint32_t i = 0; i < ${local}_arr.Length(); i++) {`;
-		yield `\t${local}_store.push_back(${local}_arr.Get(i).As<Napi::String>().Utf8Value());`;
-		yield '}';
-		yield `for (auto& s : ${local}_store) ${local}_vec.push_back(s.c_str());`;
-		yield `${local}_vec.push_back(NULL);`;
-		yield `const char** ${local} = ${local}_vec.data();`;
+		yield declare('std::vector<std::string>', `${local}_store`);
+		yield declare('std::vector<const char*>', `${local}_vec`);
+		yield `const char** ${local} = NULL;`;
+		yield* present([
+			...expect('IsArray()', 'string[]'),
+			`Napi::Array ${local}_arr = ${source}.As<Napi::Array>();`,
+			`for (uint32_t i = 0; i < ${local}_arr.Length(); i++) {`,
+			`\t${local}_store.push_back(${local}_arr.Get(i).As<Napi::String>().Utf8Value());`,
+			'}',
+			`for (auto& s : ${local}_store) ${local}_vec.push_back(s.c_str());`,
+			`${local}_vec.push_back(NULL);`,
+			`${local} = ${local}_vec.data();`,
+		]);
 		return p.type.cType ? `(${p.type.cType})${local}` : local;
 	}
 
-	if (p.type.isArray) {
-		yield `// TODO: array parameter "${p.name}" of element type "${p.type.elementType ?? '?'}"`;
-		return 'NULL';
-	}
+	if (p.type.isArray) return yield* arrayFromJs(ctx, p, source, local, storage);
 
 	if (t === 'utf8' || t === 'filename') {
-		yield `std::string ${local}_str;`;
+		yield declare('std::string', `${local}_str`);
 		yield `const char* ${local} = NULL;`;
-		if (p.nullable) {
-			yield `if (!(${absent})) {`;
-			yield* indent(...expect('IsString()', 'string'));
-			yield `\t${local}_str = ${source}.As<Napi::String>().Utf8Value();`;
-			yield `\t${local} = ${local}_str.c_str();`;
-			yield '}';
-		} else {
-			yield* expect('IsString()', 'string');
-			yield `${local}_str = ${source}.As<Napi::String>().Utf8Value();`;
-			yield `${local} = ${local}_str.c_str();`;
-		}
+		yield* present([
+			...expect('IsString()', 'string'),
+			`${local}_str = ${source}.As<Napi::String>().Utf8Value();`,
+			`${local} = ${local}_str.c_str();`,
+		]);
 		return p.type.cType ? `(${p.type.cType})${local}` : local;
+	}
+	if (t === 'GLib.Bytes') {
+		yield `GBytes* ${local} = NULL;`;
+		yield `std::unique_ptr<GBytes, void (*)(GBytes*)> ${local}_owner(nullptr, g_bytes_unref);`;
+		yield* present([
+			`if (!${source}.IsTypedArray() || ${source}.As<Napi::TypedArray>().TypedArrayType() != napi_uint8_array) {`,
+			`\tthrow Napi::TypeError::New(env, "Expected Uint8Array for '${p.name}'");`,
+			'}',
+			`Napi::TypedArray ${local}_view = ${source}.As<Napi::TypedArray>();`,
+			`${local} = g_bytes_new(static_cast<const uint8_t*>(${local}_view.ArrayBuffer().Data()) + ${local}_view.ByteOffset(), ${local}_view.ElementLength());`,
+			`${local}_owner.reset(${local});`,
+		]);
+		return local;
 	}
 	if (t === 'gboolean') {
 		yield* expect('IsBoolean()', 'boolean');
@@ -797,20 +989,165 @@ function* fromJs(ctx: TypeContext, p: Parameter, source: string, local: string):
 	// Boxed or unknown type: accept an opaque External produced elsewhere.
 	const base = ctx.cBaseType(p.type);
 	yield `${base}* ${local} = NULL;`;
-	if (p.nullable) {
-		yield `if (!(${absent})) {`;
-		yield* indent(...expect('IsExternal()', `external ${t}`));
-		yield `\t${local} = ${source}.As<Napi::External<${base}>>().Data();`;
-		yield '}';
-	} else {
-		yield* expect('IsExternal()', `external ${t}`);
-		yield `${local} = ${source}.As<Napi::External<${base}>>().Data();`;
-	}
+	yield* present([
+		...expect('IsExternal()', `external ${t}`),
+		`${local} = ${source}.As<Napi::External<${base}>>().Data();`,
+	]);
 	return local;
 }
 
-function* param(ctx: TypeContext, p: Parameter, index: number, cppParams: string[], outParams: OutParam[]): Lines {
-	if (isErrorParam(p)) return;
+/**
+ * Fill a C array `local`, and its element count `<local>_count`, from a JS array
+ * (or a `Uint8Array`, for bytes), returning the expression to pass to C.
+ */
+function* arrayFromJs(
+	ctx: TypeContext,
+	p: Parameter,
+	source: string,
+	local: string,
+	storage?: string
+): Generator<string, string, void> {
+	const element = ctx.arrayElement(p.type)!;
+	const cast = p.type.cType ? `(${p.type.cType})` : '';
+	const absent = `${source}.IsNull() || ${source}.IsUndefined()`;
+	const fail = (expected: string) => `throw Napi::TypeError::New(env, "Expected ${expected} for '${p.name}'");`;
+	const body: string[] = [];
+
+	yield `gsize ${local}_count = 0;`;
+	if (element === 'bytes') {
+		yield `const uint8_t* ${local} = NULL;`;
+		body.push(
+			`if (!${source}.IsTypedArray() || ${source}.As<Napi::TypedArray>().TypedArrayType() != napi_uint8_array) {`,
+			`\t${fail('Uint8Array')}`,
+			'}',
+			`Napi::TypedArray ${local}_view = ${source}.As<Napi::TypedArray>();`,
+			`${local} = static_cast<const uint8_t*>(${local}_view.ArrayBuffer().Data()) + ${local}_view.ByteOffset();`,
+			`${local}_count = ${local}_view.ElementLength();`
+		);
+		if (storage) body.push(`${storage}->keep(${source});`);
+	} else {
+		const item = ctx.arrayElementType(p.type);
+		const strings = element === 'string';
+		const itemType = strings ? 'const char*' : item.cType;
+		const declare = (type: string, name: string) =>
+			storage ? `${type}& ${name} = ${storage}->store<${type}>();` : `${type} ${name};`;
+		if (strings) yield declare('std::vector<std::string>', `${local}_store`);
+		yield declare(`std::vector<${itemType}>`, `${local}_vec`);
+		body.push(
+			`if (!${source}.IsArray()) {`,
+			`\t${fail(`${element}[]`)}`,
+			'}',
+			`Napi::Array ${local}_arr = ${source}.As<Napi::Array>();`,
+			`${local}_count = ${local}_arr.Length();`
+		);
+		if (p.type.fixedSize !== undefined) {
+			body.push(`if (${local}_count != ${p.type.fixedSize}) {`, `\t${fail(`${p.type.fixedSize} elements`)}`, '}');
+		}
+		body.push(
+			`for (uint32_t i = 0; i < ${local}_count; i++) {`,
+			`\tNapi::Value ${local}_item = ${local}_arr.Get(i);`
+		);
+		if (strings) {
+			body.push(`\t${local}_store.push_back(${local}_item.ToString().Utf8Value());`);
+		} else {
+			const parameter: Parameter = { ...p, type: item, transfer: 'none', nullable: false };
+			const conversion = fromJs(ctx, parameter, `${local}_item`, `${local}_element`);
+			let next = conversion.next();
+			for (; !next.done; next = conversion.next()) body.push(`\t${next.value}`);
+			body.push(`\t${local}_vec.push_back(${next.value});`);
+		}
+		body.push('}');
+		if (strings) body.push(`for (auto& s : ${local}_store) ${local}_vec.push_back(s.c_str());`);
+		if (p.type.zeroTerminated) body.push(`${local}_vec.push_back({});`);
+		yield `${itemType}* ${local} = NULL;`;
+		body.push(`${local} = ${local}_vec.data();`);
+	}
+	if (p.nullable) {
+		yield `if (!(${absent})) {`;
+		yield* indent(...body);
+		yield '}';
+	} else {
+		yield* body;
+	}
+	return `${cast}${local}`;
+}
+
+/** The scope of a callback parameter, as a `girbind::Scope`. */
+function callbackScope(p: Parameter): string {
+	const scopes: Record<string, string> = { async: 'Async', notified: 'Notified', forever: 'Forever' };
+	return scopes[p.scope ?? ''] ?? 'Call';
+}
+
+/** The C expression for a callback parameter's user data, once converted. */
+function callbackUserData(ctx: TypeContext, p: Parameter, options: CallOptions): string {
+	if (options.ready && isReadyCallback(ctx, p)) return 'pending';
+	return callbackScope(p) === 'Call' ? `callback_${p.name}.get()` : `data_${p.name}`;
+}
+
+function isReadyCallback(ctx: TypeContext, p: Parameter): boolean {
+	return ctx.qualify(p.type.girType) === 'Gio.AsyncReadyCallback';
+}
+
+/** Emit the conversion of one parameter, returning whether it reads a JS argument. */
+function* param(
+	ctx: TypeContext,
+	func: Func,
+	p: Parameter,
+	index: number,
+	cppParams: string[],
+	args: Arguments,
+	options: CallOptions
+): Generator<string, boolean, void> {
+	const parameters = func.parameters.filter(other => !other.isInstance);
+	const position = parameters.indexOf(p);
+	const override = options.overrides?.get(p);
+	if (override) {
+		cppParams.push(override);
+		return false;
+	}
+	if (isErrorParam(p)) return false;
+
+	if (p.isHidden && p.direction === 'in') {
+		const array = parameters.find(other => other.type.isArray && other.type.length === position);
+		const callback = parameters.find(
+			other =>
+				other.isBindableCallback
+				&& (other.closure === position
+					|| other.destroy === position
+					|| (other.closure === undefined && p.closure === parameters.indexOf(other)))
+		);
+		if (array) cppParams.push(`(${ctx.cType(p.type)})arg_${array.name}_count`);
+		else if (callback?.destroy === position) {
+			cppParams.push(
+				callbackScope(callback) === 'Call' ? 'NULL' : `data_${callback.name} ? girbind::destroy_callback : NULL`
+			);
+		} else if (callback) cppParams.push(callbackUserData(ctx, callback, options));
+		else cppParams.push('NULL');
+		return false;
+	}
+
+	if (p.isBindableCallback) {
+		if (options.ready && isReadyCallback(ctx, p)) {
+			cppParams.push(options.ready);
+			return false;
+		}
+		const qualified = ctx.qualify(p.type.girType);
+		const scope = callbackScope(p);
+		ctx.callbacks.add(qualified);
+		yield `std::unique_ptr<girbind::JsCallback> callback_${p.name} = girbind::new_callback(info[${index}], girbind::Scope::${scope}, "${p.name}", ${p.nullable});`;
+		if (scope === 'Call') args.afterCall.push(`girbind::rethrow(callback_${p.name}.get());`);
+		else args.beforeCall.push(`girbind::JsCallback* data_${p.name} = callback_${p.name}.release();`);
+		const cType = p.type.cType || ctx.anyCallback(qualified)!.cName;
+		cppParams.push(`${callbackUserData(ctx, p, options)} ? (${cType})${trampolineName(qualified)} : NULL`);
+		return true;
+	}
+
+	if (options.ready && p.direction === 'in' && ctx.qualify(p.type.girType) === 'Gio.Cancellable') {
+		ctx.usesAbortSignals = true;
+		yield `GCancellable* arg_${p.name} = cancellable_argument(info[${index}], call.get(), ${p.nullable});`;
+		cppParams.push(`arg_${p.name}`);
+		return true;
+	}
 
 	if (p.direction !== 'in') {
 		// Allocate a local of the pointed-to type and pass its address. The C param
@@ -826,35 +1163,44 @@ function* param(ctx: TypeContext, p: Parameter, index: number, cppParams: string
 			yield `${local} out_${p.name} = ${local.endsWith('*') || local === 'gpointer' ? 'NULL' : '{}'};`;
 		}
 		cppParams.push(`&out_${p.name}`);
-		outParams.push({ name: `out_${p.name}`, type: { ...p.type, cType: local }, transfer: p.transfer });
-		return;
+		if (!p.isHidden) {
+			args.outParams.push({
+				name: `out_${p.name}`,
+				type: { ...p.type, cType: local },
+				transfer: p.transfer,
+				length: lengthOf(func, p.type),
+			});
+		}
+		return p.direction === 'inout';
 	}
 
 	const local = `arg_${p.name}`;
-	cppParams.push(ownedArgument(ctx, p, local, yield* fromJs(ctx, p, `info[${index}]`, local)));
+	const storage = options.ready ? 'call' : undefined;
+	cppParams.push(ownedArgument(ctx, p, local, yield* fromJs(ctx, p, `info[${index}]`, local, storage)));
+	return true;
 }
 
 /**
  * Emit extraction for all of a function's parameters, returning the collected
- * output parameters (which the caller folds into the JS return). `leading` is
- * prepended to the C call args (e.g. `self` for instance methods).
+ * output parameters (which the caller folds into the JS return) and the
+ * statements to run around the call. `leading` is prepended to the C call args
+ * (e.g. `self` for instance methods).
  */
 function* emitParams(
 	ctx: TypeContext,
 	func: Func,
 	leading: string[],
-	cppParams: string[]
-): Generator<string, OutParam[], void> {
-	const outParams: OutParam[] = [];
+	cppParams: string[],
+	options: CallOptions = {}
+): Generator<string, Arguments, void> {
+	const args: Arguments = { outParams: [], beforeCall: [], afterCall: [] };
 	cppParams.push(...leading);
 	let jsIndex = 0;
 	for (const p of func.parameters) {
 		if (p.isInstance) continue;
-		yield* param(ctx, p, jsIndex, cppParams, outParams);
-		// Output params do not consume a JS argument slot.
-		if (p.direction !== 'out' && !isErrorParam(p)) jsIndex++;
+		if (yield* param(ctx, func, p, jsIndex, cppParams, args, options)) jsIndex++;
 	}
-	return outParams;
+	return args;
 }
 
 /**
@@ -864,29 +1210,38 @@ function* emitParams(
  * array of the return value (if any) followed by the out-params in order.
  */
 function* emitResult(ctx: TypeContext, func: Func, resultVar: string | null, outParams: OutParam[]): Lines {
-	const hasReturn = resultVar !== null;
-
-	if (!hasReturn && outParams.length === 0) {
+	const values = [
+		...(resultVar === null
+			? []
+			: [
+					{
+						name: resultVar,
+						type: func.returnValue.type,
+						transfer: func.returnValue.transfer,
+						length: lengthOf(func, func.returnValue.type),
+					},
+				]),
+		...outParams,
+	];
+	if (!values.length) {
 		yield 'return env.Undefined();';
 		return;
 	}
-	if (!hasReturn && outParams.length === 1) {
-		const o = outParams[0];
-		yield* convertToJs(ctx, o.type, o.transfer, o.name, v => `return ${v};`);
+	if (values.length === 1) {
+		const [value] = values;
+		yield* convertToJs(ctx, value.type, value.transfer, value.name, v => `return ${v};`, value.length);
 		return;
 	}
-	if (hasReturn && outParams.length === 0) {
-		yield* convertToJs(ctx, func.returnValue.type, func.returnValue.transfer, resultVar, v => `return ${v};`);
-		return;
-	}
-
 	yield 'Napi::Array js_result = Napi::Array::New(env);';
-	const values = [
-		...(hasReturn ? [{ type: func.returnValue.type, transfer: func.returnValue.transfer, name: resultVar }] : []),
-		...outParams,
-	];
 	for (const [index, value] of values.entries()) {
-		yield* convertToJs(ctx, value.type, value.transfer, value.name, v => `js_result.Set(${index}u, ${v});`);
+		yield* convertToJs(
+			ctx,
+			value.type,
+			value.transfer,
+			value.name,
+			v => `js_result.Set(${index}u, ${v});`,
+			value.length
+		);
 	}
 	yield 'return js_result;';
 }
@@ -963,13 +1318,14 @@ function* file(ns: Namespace, options: Options): Lines {
 	const ctx = new TypeContext(ns, options.repository, options.modules);
 	const moduleName = options.moduleName ?? ns.name.toLowerCase();
 
-	const body = [
+	const definitions = [
 		...boundRecords(ctx).flatMap(type => [...ownerDef(ctx, recordOwner(ctx, type))]),
 		...boundInterfaces(ctx).flatMap(iface => [...ownerDef(ctx, interfaceOwner(ctx, iface))]),
 		...boundClasses(ctx).flatMap(cls => [...ownerDef(ctx, classOwner(ctx, cls))]),
 		...ns.functions.filter(isSupported).flatMap(func => [...standalone(ctx, func)]),
 		...moduleInit(ctx, moduleName),
 	];
+	const trampolines = [...ctx.callbacks].sort().flatMap(qualified => [...trampoline(ctx, qualified)]);
 
 	yield `// Generated by girbind from ${ns.name}-${ns.version}`;
 	yield '// DO NOT EDIT THIS FILE DIRECTLY';
@@ -981,7 +1337,9 @@ function* file(ns: Namespace, options: Options): Lines {
 	yield '';
 	yield 'namespace {';
 	yield '';
-	yield* body;
+	if (ctx.usesAbortSignals) yield* cancellableArgument;
+	yield* trampolines;
+	yield* definitions;
 }
 
 export function generate(ns: Namespace, options: Options = {}): string {

@@ -7,13 +7,35 @@
  * (everything else — boxed records, fundamental types, unknown namespaces).
  */
 
-import type { Class, Enumeration, Interface, Namespace, RecordBinding, Struct, TypeInfo, TypeRef } from './ir.js';
+import type {
+	Callback,
+	Class,
+	Enumeration,
+	Interface,
+	Namespace,
+	RecordBinding,
+	Struct,
+	Transfer,
+	TypeInfo,
+	TypeRef,
+} from './ir.js';
 import type { Repository } from './parse.js';
 import girToCxx from './types/cxx.json' with { type: 'json' };
 import girToTs from './types/ts.json' with { type: 'json' };
 
 const cxxTable: Record<string, string> = girToCxx;
 const tsTable: Record<string, string> = girToTs;
+
+/** Qualify the type names in a type from `namespace`'s GIR so they resolve from any namespace. */
+export function qualifyType(type: TypeRef, namespace: string): TypeRef {
+	const qualify = (name: string) =>
+		/^[A-Z]/.test(name) && !name.includes('.') && !(name in cxxTable) ? `${namespace}.${name}` : name;
+	return {
+		...type,
+		girType: qualify(type.girType),
+		elementType: type.elementType && qualify(type.elementType),
+	};
+}
 
 /** Strip a namespace prefix from a qualified GIR name (`Flatpak.Ref` → `Ref`). */
 export function shortName(girType: string): string {
@@ -26,6 +48,9 @@ const runtimeClasses: Record<string, string> = {
 	'GObject.Object': 'GObject',
 	'GObject.InitiallyUnowned': 'GInitiallyUnowned',
 };
+
+/** How the elements of a C array convert: bytes become a `Uint8Array`, the rest a JS array. */
+export type ArrayElement = 'bytes' | 'number' | 'boolean' | 'string' | 'object' | 'record';
 
 /** A record from any loaded namespace that girbind can hold. */
 export interface RecordType {
@@ -65,6 +90,10 @@ export class TypeContext {
 	readonly repository: Repository;
 	/** `get_type` functions the generated code calls, which it declares itself. */
 	readonly typeFunctions = new Set<string>();
+	/** Qualified names of the callback types the generated code calls JS through. */
+	readonly callbacks = new Set<string>();
+	/** Whether the generated code converts AbortSignals to cancellables. */
+	usesAbortSignals = false;
 
 	/**
 	 * @param modules import specifiers of other bound namespaces, by namespace name
@@ -94,6 +123,12 @@ export class TypeContext {
 	anyInterface(girType: string): Interface | undefined {
 		const [namespace, name] = this.split(girType);
 		return namespace?.interfaces.find(i => i.name === name);
+	}
+
+	/** A callback type from any loaded namespace. */
+	anyCallback(girType: string): Callback | undefined {
+		const [namespace, name] = this.split(girType);
+		return namespace?.callbacks.find(c => c.name === name);
 	}
 
 	/** A class from any loaded namespace. */
@@ -218,12 +253,78 @@ export class TypeContext {
 	 * known element type; `unknown` otherwise.
 	 */
 	arrayKind(type: TypeRef): 'strv' | 'ptrArray' | 'cArray' | 'unknown' {
-		if (type.girType === 'GLib.Strv' || type.elementType === 'utf8' || type.elementType === 'filename') {
+		const strings = type.elementType === 'utf8' || type.elementType === 'filename';
+		if (type.girType === 'GLib.Strv' || (strings && type.length === undefined && type.fixedSize === undefined)) {
 			return 'strv';
 		}
 		if (type.girType === 'GLib.PtrArray' || /GPtrArray/.test(type.cType)) return 'ptrArray';
-		if (type.elementType) return 'cArray';
+		if (type.elementType && !type.girType) return 'cArray';
 		return 'unknown';
+	}
+
+	/** How the elements of a C array convert, or undefined when girbind cannot convert them. */
+	arrayElement(type: TypeRef): ArrayElement | undefined {
+		const element = type.elementType ?? '';
+		if (element === 'guint8' || element === 'gint8') return 'bytes';
+		if (element === 'utf8' || element === 'filename') return 'string';
+		if (element === 'gboolean') return 'boolean';
+		if (this.enumeration(element) || this.isPrimitive(element)) return 'number';
+		if (this.objectType(element)) return 'object';
+		if (this.recordType(element)) return 'record';
+		return undefined;
+	}
+
+	/**
+	 * The type of a C array's elements, with a C type derived from the array's
+	 * when the GIR omits it. Records are stored inline unless the array's C type
+	 * points to pointers, whatever the element's C type says.
+	 */
+	arrayElementType(type: TypeRef): TypeRef {
+		const girType = type.elementType ?? '';
+		const element = { girType, cType: type.elementCType ?? '', isArray: false };
+		const record = this.recordType(girType);
+		if (record) {
+			element.cType = record.record.cName + (/\*\s*\*/.test(type.cType) ? '*' : '');
+			return element;
+		}
+		if (element.cType) return element;
+		const object = this.objectType(girType);
+		const enumeration = this.enumeration(girType);
+		if (object) element.cType = `${object.info.cName}*`;
+		else if (enumeration) element.cType = enumeration.cName;
+		else if (girType === 'utf8' || girType === 'filename') element.cType = 'char*';
+		else element.cType = this.cType(element);
+		return element;
+	}
+
+	/** Whether girbind converts an array passed in `direction`. */
+	convertsArray(type: TypeRef, direction: 'in' | 'out'): boolean {
+		const kind = this.arrayKind(type);
+		if (kind === 'strv') return true;
+		if (kind === 'ptrArray') return direction === 'out';
+		const element = kind === 'cArray' ? this.arrayElement(type) : undefined;
+		if (!element) return false;
+		if (type.length !== undefined || type.fixedSize !== undefined) return true;
+		return !!type.zeroTerminated && element !== 'record';
+	}
+
+	/** Whether girbind converts a C value of this type to JS. */
+	convertsToJs(type: TypeRef): boolean {
+		if (type.isArray) return this.convertsArray(type, 'out');
+		const t = type.girType;
+		if (t === 'utf8' || t === 'filename' || t === 'GLib.Bytes') return true;
+		if (t === 'gboolean' || this.enumeration(t) || this.isPrimitive(t)) return !type.cType.includes('*');
+		return !!this.recordType(t) || !!this.objectType(t);
+	}
+
+	/** Whether girbind converts a JS value to a C return value of this type, which the caller owns per `transfer`. */
+	convertsResult(type: TypeRef, transfer: Transfer): boolean {
+		if (type.isArray) return false;
+		const t = type.girType;
+		if (t === 'none' || t === 'gboolean' || this.enumeration(t) || this.isPrimitive(t))
+			return !type.cType.includes('*');
+		if (t === 'utf8' || t === 'filename' || this.recordType(t)) return transfer === 'full';
+		return !!this.objectType(t);
 	}
 
 	/** Namespaces with an import specifier, other than this one, that this namespace can see. */
@@ -269,6 +370,8 @@ export class TypeContext {
 
 	/** Map a GIR type to its TypeScript type. */
 	tsType(type: TypeRef): string {
+		if (type.isArray && this.arrayKind(type) === 'cArray' && this.arrayElement(type) === 'bytes')
+			return 'Uint8Array';
 		if (type.isArray) {
 			const elem = type.elementType ?? '';
 			if (elem === 'utf8' || elem === 'filename') return 'string[]';

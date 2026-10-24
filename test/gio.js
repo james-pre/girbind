@@ -44,7 +44,94 @@ const [temporary, temporaryStream] = Gio.File.newTmp(null);
 assert.ok(temporary instanceof Gio.File && temporaryStream instanceof Gio.FileIOStream, 'static interface functions');
 temporaryStream.close(null);
 assert.ok(temporary.delete(null), 'a throwing interface method succeeds');
-assert.throws(() => temporary.delete(null), /No such file/, 'a GError becomes a JS error');
+assert.throws(
+	() => temporary.delete(null),
+	error => error.domain === 'g-io-error-quark' && error.code === Gio.IOErrorEnum.not_found,
+	'a GError becomes a JS error with its domain and code'
+);
+
+// --- asynchronous functions -----------------------------------------------------
+const [loaded, contents] = await file.loadContentsAsync(null);
+assert.ok(loaded && contents instanceof Uint8Array, 'an async function resolves with its finish function result');
+assert.equal(Buffer.from(contents).toString(), 'first\nsecond:third\n', 'a byte array with a length is a Uint8Array');
+
+const [replaced] = await file.replaceContentsAsync(
+	Buffer.from('replaced'),
+	null,
+	false,
+	Gio.FileCreateFlags.none,
+	null
+);
+assert.ok(replaced, 'a Uint8Array argument is kept alive until the call completes');
+assert.equal(Buffer.from(file.loadContents(null)[1]).toString(), 'replaced');
+const [bytesReplaced] = await new Promise((resolve, reject) => {
+	file.replaceContentsBytesAsync(Buffer.from('bytes'), null, false, Gio.FileCreateFlags.none, null, (_, result) => {
+		try {
+			resolve(file.replaceContentsFinish(result));
+		} catch (error) {
+			reject(error);
+		}
+	});
+});
+assert.ok(bytesReplaced, 'an async-scoped callback runs once, keeping Node alive until then');
+assert.equal(Buffer.from(file.loadContents(null)[1]).toString(), 'bytes', 'a Uint8Array converts to GLib.Bytes');
+
+const [created, createdStream] = await Gio.File.newTmpAsync(null, 0, null);
+assert.ok(created instanceof Gio.File && createdStream instanceof Gio.FileIOStream, 'static async functions');
+createdStream.close(null);
+created.delete(null);
+
+await assert.rejects(
+	Gio.File.newForPath(join(directory, 'missing')).loadContentsAsync(null),
+	error => error.domain === 'g-io-error-quark' && error.code === Gio.IOErrorEnum.not_found,
+	'a GError rejects the promise'
+);
+
+const reason = new Error('stop');
+await assert.rejects(file.loadContentsAsync(AbortSignal.abort(reason)), error => error === reason, 'an aborted signal');
+const controller = new AbortController();
+const pending = file.loadContentsAsync(controller.signal);
+controller.abort();
+await assert.rejects(pending, { name: 'AbortError' }, 'aborting a pending call rejects with the reason');
+assert.throws(() => file.loadContentsAsync({}), TypeError, 'cancellables are Gio.Cancellables or AbortSignals');
+
+// --- callbacks ----------------------------------------------------------------
+const copy = Gio.File.newForPath(join(directory, 'copy.txt'));
+const progress = [];
+assert.ok(file.copy(copy, Gio.FileCopyFlags.overwrite, null, (current, total) => progress.push([current, total])));
+assert.ok(progress.length > 0, 'a call-scoped callback runs during the call');
+assert.deepEqual(progress.at(-1), [5, 5]);
+
+const failure = new Error('from a callback');
+assert.throws(
+	() =>
+		file.copy(copy, Gio.FileCopyFlags.overwrite, null, () => {
+			throw failure;
+		}),
+	error => error === failure,
+	"a call-scoped callback's exception is rethrown to the caller"
+);
+
+const asyncProgress = [];
+assert.ok(await file.copyAsync(copy, Gio.FileCopyFlags.overwrite, 0, null, current => asyncProgress.push(current)));
+assert.ok(asyncProgress.length > 0, 'a callback passed to an async function runs until it completes');
+
+const vfs = Gio.Vfs.getDefault();
+const lookups = [];
+assert.ok(
+	vfs.registerUriScheme(
+		'girbind',
+		(_, identifier) => {
+			lookups.push(identifier);
+			return Gio.File.newForPath(path);
+		},
+		null
+	),
+	'a notified callback is registered'
+);
+assert.equal(Gio.File.newForUri('girbind://anything').getPath(), path, "a notified callback's result is returned to C");
+assert.deepEqual(lookups, ['girbind://anything']);
+assert.ok(vfs.unregisterUriScheme('girbind'), 'its destroy notify frees it');
 
 rmSync(directory, { recursive: true });
 console.log('gio.js: all assertions passed');

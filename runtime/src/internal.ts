@@ -124,3 +124,26 @@ export function watchFinalization(wrapper: object): void {
 export function finalized(): number {
 	return native.finalized();
 }
+
+/** Keep the event loop alive while an asynchronous call is pending. */
+export function holdLoop(): void {
+	native.holdLoop();
+}
+
+export function releaseLoop(): void {
+	native.releaseLoop();
+}
+
+/**
+ * Call `listener` when `signal` aborts (now, if it already has), returning a
+ * function that stops listening. Throws unless `signal` is an AbortSignal.
+ */
+export function onAbort(signal: unknown, listener: () => void): () => void {
+	if (!(signal instanceof AbortSignal)) throw new TypeError('Expected a Gio.Cancellable or an AbortSignal');
+	if (signal.aborted) {
+		listener();
+		return () => {};
+	}
+	signal.addEventListener('abort', listener, { once: true });
+	return () => signal.removeEventListener('abort', listener);
+}

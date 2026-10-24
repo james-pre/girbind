@@ -11,6 +11,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { XMLParser } from 'fast-xml-parser';
 import type {
+	Callback,
 	Class,
 	Direction,
 	EnumMember,
@@ -29,6 +30,8 @@ import type {
 	TypeInfo,
 	TypeRef,
 } from './ir.js';
+import { isSupported } from './names.js';
+import { TypeContext } from './types.js';
 
 /** Attribute key prefix used by the parser (e.g. `@_name`, `@_c:type`). */
 const ATTR = '@_';
@@ -115,11 +118,17 @@ function parseTypeRef(owner: Node | undefined): TypeRef {
 	const arrayElem = child(owner, 'array');
 	if (arrayElem) {
 		const inner = child(arrayElem, 'type');
+		const length = attr(arrayElem, 'length');
+		const fixedSize = attr(arrayElem, 'fixed-size');
 		return {
 			girType: attr(arrayElem, 'name') ?? '',
 			cType: attr(arrayElem, 'c:type') ?? '',
 			isArray: true,
 			elementType: inner ? (attr(inner, 'name') ?? '') : '',
+			elementCType: inner ? attr(inner, 'c:type') : undefined,
+			length: length === undefined ? undefined : Number(length),
+			fixedSize: fixedSize === undefined ? undefined : Number(fixedSize),
+			zeroTerminated: boolAttr(arrayElem, 'zero-terminated', length === undefined && fixedSize === undefined),
 		};
 	}
 
@@ -194,7 +203,13 @@ function parseParameter(node: Node, isInstance: boolean): Parameter {
 		isInstance,
 		callerAllocates: boolAttr(node, 'caller-allocates'),
 		scope: attr(node, 'scope'),
+		closure: index(attr(node, 'closure')),
+		destroy: index(attr(node, 'destroy')),
 	};
+}
+
+function index(value: string | undefined): number | undefined {
+	return value === undefined ? undefined : Number(value);
 }
 
 function parseReturnValue(node: Node | undefined): ReturnValue {
@@ -239,6 +254,19 @@ function parseFunction(node: Node, kind: FuncKind): Func | undefined {
 		isConstructor: kind.isConstructor ?? false,
 		isStatic: kind.isStatic ?? false,
 		throws: boolAttr(node, 'throws'),
+		finishName: attr(node, 'glib:finish-func'),
+	};
+}
+
+function parseCallback(node: Node, nsPrefix: string): Callback | undefined {
+	const func = parseFunction(node, {});
+	if (!func) return undefined;
+	return {
+		name: func.name,
+		cName: attr(node, 'c:type') ?? nsPrefix + func.name,
+		parameters: func.parameters,
+		returnValue: func.returnValue,
+		throws: func.throws,
 	};
 }
 
@@ -450,8 +478,8 @@ export function parseGir(xml: string): Namespace {
 			.filter((record): record is Struct => !!record),
 		unions: typeInfos('union'),
 		callbacks: children(nsNode, 'callback')
-			.map(node => attr(node, 'name'))
-			.filter((callback): callback is string => !!callback),
+			.map(node => parseCallback(node, nsPrefix))
+			.filter((callback): callback is Callback => !!callback),
 		functions,
 		enumerations,
 	};
@@ -533,29 +561,120 @@ function bindRecords(repository: Repository, callbacks: Set<string>): void {
 	}
 }
 
+/** Constructors, methods and static functions, grouped by the type (or namespace) declaring them. */
+function functionGroups(ns: Namespace): Func[][] {
+	return [
+		ns.functions,
+		...[...ns.classes, ...ns.interfaces, ...ns.records].map(owner => [
+			...owner.constructors,
+			...owner.methods,
+			...owner.staticMethods,
+		]),
+	];
+}
+
+/** The index of a callback type's user data parameter, if it has one. */
+export function callbackData(callback: Callback): number | undefined {
+	const index = callback.parameters.findIndex(p => p.closure !== undefined);
+	if (index !== -1) return index;
+	const last = callback.parameters.at(-1);
+	return last?.type.girType === 'gpointer' ? callback.parameters.length - 1 : undefined;
+}
+
+/** Indices of parameters holding the length of an array parameter or return value. */
+export function lengthIndices(parameters: Parameter[], returnValue?: ReturnValue): Set<number> {
+	const types = [...parameters.map(p => p.type), ...(returnValue ? [returnValue.type] : [])];
+	return new Set(types.flatMap(type => (type.isArray && type.length !== undefined ? [type.length] : [])));
+}
+
+/** Whether JS functions can be passed for a callback type: girbind converts its arguments and result. */
+function isBindable(ctx: TypeContext, callback: Callback): boolean {
+	const data = callbackData(callback);
+	if (callback.throws || data === undefined) return false;
+	const lengths = lengthIndices(callback.parameters);
+	return (
+		callback.parameters.every(
+			(p, i) => i === data || lengths.has(i) || (p.direction === 'in' && ctx.convertsToJs(p.type))
+		) && ctx.convertsResult(callback.returnValue.type, callback.returnValue.transfer)
+	);
+}
+
+/** Flag arrays girbind cannot convert, and hide the length parameters of those it can. */
+function annotateArrays(ctx: TypeContext, func: Func): void {
+	const parameters = func.parameters.filter(p => !p.isInstance);
+	const arrays = [
+		...parameters.map(p => ({ holder: p, direction: p.direction })),
+		{ holder: func.returnValue, direction: 'out' as Direction },
+	];
+	for (const { holder, direction } of arrays) {
+		const { type } = holder;
+		if (!type.isArray) continue;
+		const owned = holder.transfer !== 'none' && ctx.arrayKind(type) !== 'strv';
+		const length = type.length === undefined ? undefined : parameters[type.length];
+		if (
+			direction === 'inout'
+			|| !ctx.convertsArray(type, direction)
+			|| (direction === 'in' && owned)
+			|| length?.direction === 'inout'
+		) {
+			holder.isOpaqueArray = true;
+			continue;
+		}
+		if (length && (direction === 'in' || length.direction === 'out')) length.isHidden = true;
+	}
+}
+
+/** Mark callback parameters girbind can pass JS functions for, hiding their user data and destroy notify. */
+function annotateCallbacks(callbacks: Map<string, Callback>, namespace: string, func: Func): void {
+	const parameters = func.parameters.filter(p => !p.isInstance);
+	for (const [i, p] of parameters.entries()) {
+		if (!p.isCallback || p.direction !== 'in') continue;
+		const found = parameters.findIndex(other => other.closure === i);
+		const data = p.closure ?? (found === -1 ? undefined : found);
+		if (!callbacks.get(qualify(p.type.girType, namespace))?.isBindable || data === undefined || data === i)
+			continue;
+		const shared = parameters.some((other, j) => j !== i && other.isCallback && other.closure === data);
+		if (shared || parameters[data].direction !== 'in') continue;
+		p.isBindableCallback = true;
+		parameters[data].isHidden = true;
+		if (p.destroy !== undefined) parameters[p.destroy].isHidden = true;
+	}
+}
+
+/** Pair an asynchronous function with the function completing it, so it is bound as a promise. */
+function annotateAsync(namespace: string, func: Func, group: Func[]): void {
+	const ready = func.parameters.find(
+		p => p.isBindableCallback && qualify(p.type.girType, namespace) === 'Gio.AsyncReadyCallback'
+	);
+	if (!ready) return;
+	const name = func.finishName ?? (func.name.endsWith('_async') ? func.name.slice(0, -6) : func.name) + '_finish';
+	const finish = group.find(candidate => candidate.name === name);
+	if (!finish || !isSupported(finish)) return;
+	const inputs = finish.parameters.filter(
+		p => !p.isInstance && p.direction !== 'out' && p.type.cType.replace(/\s/g, '') !== 'GError**'
+	);
+	if (inputs.length !== 1 || qualify(inputs[0].type.girType, namespace) !== 'Gio.AsyncResult') return;
+	func.finish = finish;
+}
+
 /** Flag parameters whose handling depends on types from other namespaces in the repository. */
 function annotateParameters(repository: Repository): void {
-	const callbacks = new Set<string>();
+	const callbacks = new Map<string, Callback>();
 	const records = new Map<string, Struct>();
 	const enumerations = new Set<string>();
 	for (const ns of repository.values()) {
-		for (const callback of ns.callbacks) callbacks.add(`${ns.name}.${callback}`);
+		for (const callback of ns.callbacks) callbacks.set(`${ns.name}.${callback.name}`, callback);
 		for (const record of ns.records) records.set(`${ns.name}.${record.name}`, record);
 		for (const enumeration of ns.enumerations) enumerations.add(`${ns.name}.${enumeration.name}`);
 	}
-	bindRecords(repository, callbacks);
+	bindRecords(repository, new Set(callbacks.keys()));
 
 	for (const ns of repository.values()) {
-		const functions = [
-			...ns.functions,
-			...[...ns.classes, ...ns.interfaces, ...ns.records].flatMap(owner => [
-				...owner.constructors,
-				...owner.methods,
-				...owner.staticMethods,
-			]),
-		];
+		const ctx = new TypeContext(ns, repository);
+		const functions = functionGroups(ns).flat();
 		for (const func of functions) {
 			if (callbacks.has(qualify(func.returnValue.type.girType, ns.name))) func.returnValue.isCallback = true;
+			annotateArrays(ctx, func);
 		}
 		for (const parameter of functions.flatMap(func => func.parameters)) {
 			const qualified = qualify(parameter.type.girType, ns.name);
@@ -573,5 +692,13 @@ function annotateParameters(repository: Repository): void {
 			if (record.binding && !record.isOpaque && record.fields.length) parameter.fillsRecord = true;
 			else parameter.isRecordOut = true;
 		}
+		for (const callback of ns.callbacks) callback.isBindable = isBindable(ctx, callback);
+	}
+
+	for (const ns of repository.values()) {
+		for (const func of functionGroups(ns).flat()) annotateCallbacks(callbacks, ns.name, func);
+	}
+	for (const ns of repository.values()) {
+		for (const group of functionGroups(ns)) for (const func of group) annotateAsync(ns.name, func, group);
 	}
 }

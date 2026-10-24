@@ -4,21 +4,25 @@
 // `Symbol.for("girbind.handle")`. Any addon can read a handle; wrappers for
 // existing objects are created by the runtime's `wrap`, and classes and
 // interfaces are registered with the runtime by GType name so other addons can
-// extend and implement them.
+// extend and implement them. Callbacks and asynchronous calls let C call JS
+// functions and settle promises from the GLib main loop, which the runtime
+// iterates on the main thread.
 // The layout of `Handle` is part of the ABI: change `abi_version` with it.
 
 #pragma once
 
 #include <cstring>
-#include <initializer_list>
 #include <glib-object.h>
+#include <initializer_list>
+#include <memory>
 #include <napi.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace girbind {
 
-inline constexpr uint32_t abi_version = 3;
+inline constexpr uint32_t abi_version = 4;
 
 enum class Kind : uint32_t { Object, Boxed, Plain };
 
@@ -77,9 +81,25 @@ struct Runtime {
 	Napi::FunctionReference register_class;
 	Napi::FunctionReference register_interface;
 	Napi::FunctionReference lookup;
+	Napi::FunctionReference hold_loop;
+	Napi::FunctionReference release_loop;
+	Napi::FunctionReference on_abort;
 	Napi::Reference<Napi::Symbol> key;
 	Napi::Reference<Napi::Symbol> adopt;
 };
+
+/** The thread an addon's environment runs on, and whether that environment is still alive. */
+struct Environment {
+	std::thread::id thread;
+	bool alive = false;
+};
+
+inline Environment environment;
+
+/** Whether JS can be called from here: on the environment's thread, before it is torn down. */
+inline bool on_main_thread() {
+	return environment.alive && std::this_thread::get_id() == environment.thread;
+}
 
 inline Runtime &runtime(Napi::Env env) {
 	Runtime *state = env.GetInstanceData<Runtime>();
@@ -106,9 +126,33 @@ inline void init(const Napi::CallbackInfo &info) {
 		Napi::Persistent(abi.Get("register").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("registerInterface").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("lookup").As<Napi::Function>()),
+		Napi::Persistent(abi.Get("holdLoop").As<Napi::Function>()),
+		Napi::Persistent(abi.Get("releaseLoop").As<Napi::Function>()),
+		Napi::Persistent(abi.Get("onAbort").As<Napi::Function>()),
 		Napi::Persistent(abi.Get("handle").As<Napi::Symbol>()),
 		Napi::Persistent(abi.Get("adopt").As<Napi::Symbol>()),
 	});
+	environment = {std::this_thread::get_id(), true};
+	napi_add_env_cleanup_hook(env, [](void *) { environment.alive = false; }, nullptr);
+}
+
+/** Call a runtime function for its effect, ignoring any exception, as destructors must not throw. */
+inline void call_quietly(napi_env env, const Napi::FunctionReference &function) {
+	napi_value receiver, result;
+	napi_get_undefined(env, &receiver);
+	if (napi_call_function(env, receiver, function.Value(), 0, nullptr, &result) != napi_ok) {
+		napi_value exception;
+		napi_get_and_clear_last_exception(env, &exception);
+	}
+}
+
+/** A JS error for `error`, with its GLib error domain and code, freeing `error`. */
+inline Napi::Error from_gerror(Napi::Env env, GError *error) {
+	Napi::Error result = Napi::Error::New(env, error->message);
+	result.Value().Set("domain", Napi::String::New(env, g_quark_to_string(error->domain)));
+	result.Value().Set("code", Napi::Number::New(env, error->code));
+	g_error_free(error);
+	return result;
 }
 
 inline Handle *handle_of(Napi::Value value) {
@@ -470,6 +514,188 @@ inline void set_property(Napi::Value self, const char *name, Napi::Value source)
 	}
 	g_object_set_property(object, name, &value);
 	g_value_unset(&value);
+}
+
+// --- callbacks -----------------------------------------------------------------
+
+/** When C may call a callback: during the call, once, until its destroy notify, or for the process lifetime. */
+enum class Scope { Call, Async, Notified, Forever };
+
+/** A JS function that C calls through a generated trampoline, passed as the callback's user data. */
+struct JsCallback {
+	napi_env env;
+	Scope scope;
+	napi_ref function = nullptr;
+	/** The first exception a `Call` scoped callback threw, rethrown to its caller. */
+	napi_ref error = nullptr;
+
+	JsCallback(Napi::Function value, Scope scope) : env(value.Env()), scope(scope) {
+		napi_create_reference(env, value, 1, &function);
+		if (scope == Scope::Async)
+			call_quietly(env, runtime(env).hold_loop);
+	}
+
+	JsCallback(const JsCallback &) = delete;
+	JsCallback &operator=(const JsCallback &) = delete;
+
+	~JsCallback() {
+		if (!on_main_thread())
+			return;
+		if (scope == Scope::Async)
+			call_quietly(env, runtime(env).release_loop);
+		napi_delete_reference(env, function);
+		if (error)
+			napi_delete_reference(env, error);
+	}
+
+	/** Call the function, returning an empty value if it threw. */
+	Napi::Value call(const std::vector<napi_value> &args) {
+		if (error)
+			return Napi::Value();
+		napi_value target, receiver, result;
+		napi_get_reference_value(env, function, &target);
+		napi_get_undefined(env, &receiver);
+		if (napi_call_function(env, receiver, target, args.size(), args.data(), &result) == napi_ok)
+			return Napi::Value(env, result);
+		napi_value exception;
+		napi_get_and_clear_last_exception(env, &exception);
+		fail(exception);
+		return Napi::Value();
+	}
+
+	/** Keep an exception for a `Call` scoped callback's caller, or report it as uncaught. */
+	void fail(napi_value exception) {
+		if (scope != Scope::Call) {
+			napi_fatal_exception(env, exception);
+			return;
+		}
+		if (!error)
+			napi_create_reference(env, exception, 1, &error);
+	}
+};
+
+/** A callback calling `value`, or null when `value` is null or undefined and the parameter is `nullable`. */
+inline std::unique_ptr<JsCallback> new_callback(Napi::Value value, Scope scope, const char *name, bool nullable) {
+	if (nullable && (value.IsNull() || value.IsUndefined()))
+		return nullptr;
+	if (!value.IsFunction())
+		throw Napi::TypeError::New(value.Env(), std::string("Expected a function for '") + name + "'");
+	return std::make_unique<JsCallback>(value.As<Napi::Function>(), scope);
+}
+
+/** Throw the exception a `Call` scoped callback's function threw, once the C call it was passed to returns. */
+inline void rethrow(JsCallback *callback) {
+	if (!callback || !callback->error)
+		return;
+	napi_value exception;
+	napi_get_reference_value(callback->env, callback->error, &exception);
+	throw Napi::Error(callback->env, exception);
+}
+
+/** Run a trampoline's `body` in a handle scope, then free an `Async` scoped callback. */
+template <typename Body> void invoke(JsCallback *callback, Body body) {
+	if (!on_main_thread()) {
+		if (environment.alive)
+			g_critical(
+				"girbind: a callback was called on a thread other than the main thread; its JS function was skipped"
+			);
+		return;
+	}
+	{
+		Napi::HandleScope scope(callback->env);
+		try {
+			body(Napi::Env(callback->env));
+		} catch (const Napi::Error &error) {
+			callback->fail(error.Value());
+		}
+	}
+	if (callback->scope == Scope::Async)
+		delete callback;
+}
+
+/** The destroy notify of a `Notified` scoped callback, which frees it on the main thread. */
+inline void destroy_callback(gpointer data) {
+	auto *callback = static_cast<JsCallback *>(data);
+	if (on_main_thread() || !environment.alive) {
+		delete callback;
+		return;
+	}
+	g_idle_add(
+		[](gpointer data) -> gboolean {
+			delete static_cast<JsCallback *>(data);
+			return G_SOURCE_REMOVE;
+		},
+		callback
+	);
+}
+
+// --- asynchronous calls --------------------------------------------------------
+
+/** A pending call to an asynchronous function: the promise it settles, and what it keeps alive until then. */
+struct AsyncCall {
+	napi_env env;
+	Napi::Promise::Deferred deferred;
+	/** The AbortSignal passed for the call's cancellable, if any. */
+	Napi::ObjectReference signal;
+	Napi::FunctionReference unwatch;
+	/** A cancellable created for `signal`, owned by the call. */
+	GObject *cancellable = nullptr;
+	std::vector<Napi::Reference<Napi::Value>> values;
+	std::vector<std::shared_ptr<void>> storage;
+
+	explicit AsyncCall(Napi::Env env) : env(env), deferred(Napi::Promise::Deferred::New(env)) {
+		call_quietly(env, runtime(env).hold_loop);
+	}
+
+	AsyncCall(const AsyncCall &) = delete;
+	AsyncCall &operator=(const AsyncCall &) = delete;
+
+	~AsyncCall() {
+		if (!unwatch.IsEmpty())
+			call_quietly(env, unwatch);
+		if (cancellable)
+			g_object_unref(cancellable);
+		call_quietly(env, runtime(env).release_loop);
+	}
+
+	/** A new `T` that lives until the call settles, for arguments C may read after the call returns. */
+	template <typename T> T &store() {
+		auto value = std::make_shared<T>();
+		storage.push_back(value);
+		return *value;
+	}
+
+	/** Keep `value` alive until the call settles. */
+	void keep(Napi::Value value) {
+		values.push_back(Napi::Persistent(value));
+	}
+};
+
+/** Cancel `cancellable`, which the call then owns, when the AbortSignal `signal` aborts. */
+inline void watch_abort(AsyncCall *call, Napi::Value signal, GObject *cancellable, void (*cancel)(GObject *)) {
+	Napi::Env env = signal.Env();
+	call->cancellable = cancellable;
+	Napi::Function listener =
+		Napi::Function::New(env, [cancellable, cancel](const Napi::CallbackInfo &) { cancel(cancellable); });
+	call->unwatch = Napi::Persistent(runtime(env).on_abort.Call({signal, listener}).As<Napi::Function>());
+	call->signal = Napi::Persistent(signal.As<Napi::Object>());
+}
+
+/** Resolve a call's promise with what `convert` returns, or reject it with what it throws or the abort reason. */
+template <typename Convert> void settle(AsyncCall *call, Convert convert) {
+	if (!on_main_thread())
+		return;
+	std::unique_ptr<AsyncCall> owned(call);
+	Napi::Env env(call->env);
+	Napi::HandleScope scope(env);
+	try {
+		call->deferred.Resolve(convert(env));
+	} catch (const Napi::Error &error) {
+		Napi::Value reason = error.Value();
+		if (!call->signal.IsEmpty() && call->signal.Value().Get("aborted").ToBoolean())
+			reason = call->signal.Value().Get("reason");
+		call->deferred.Reject(reason);
+	}
 }
 
 } // namespace girbind

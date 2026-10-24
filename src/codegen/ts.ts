@@ -9,10 +9,10 @@
  * lines; {@link generate} joins them. Emitted code is tab-indented.
  */
 
-import type { Class, Enumeration, Func, Interface, Namespace, Signal, TypeRef } from '../ir.js';
+import type { Class, Enumeration, Func, Interface, Namespace, Parameter, Signal, TypeRef } from '../ir.js';
 import { factoryName, functionExportNames, methodName, propertyKey } from '../names.js';
-import type { Repository } from '../parse.js';
-import { type RecordType, TypeContext } from '../types.js';
+import { callbackData, lengthIndices, type Repository } from '../parse.js';
+import { qualifyType, type RecordType, TypeContext } from '../types.js';
 import {
 	boundClasses,
 	boundInterfaces,
@@ -44,8 +44,37 @@ function* enumDecl(e: Enumeration): Lines {
 	yield '';
 }
 
+/** The function type JS passes for a callback parameter. */
+function callbackType(ctx: TypeContext, p: Parameter): string {
+	const qualified = ctx.qualify(p.type.girType);
+	const callback = ctx.anyCallback(qualified)!;
+	const namespace = namespaceOf(qualified);
+	const data = callbackData(callback);
+	const lengths = lengthIndices(callback.parameters);
+	const args = callback.parameters
+		.filter((_, i) => i !== data && !lengths.has(i))
+		.map(q => `${parameterName(q.name)}: ${typed(ctx, qualifyType(q.type, namespace), q.nullable)}`);
+	const rv = callback.returnValue;
+	const result = rv.type.girType === 'none' ? 'void' : typed(ctx, qualifyType(rv.type, namespace), rv.nullable);
+	return `(${args.join(', ')}) => ${result}`;
+}
+
+/** Whether a parameter is the ready callback of a function bound as a promise. */
+function isReady(ctx: TypeContext, func: Func, p: Parameter): boolean {
+	return !!func.finish && p.isBindableCallback === true && ctx.qualify(p.type.girType) === 'Gio.AsyncReadyCallback';
+}
+
+function paramType(ctx: TypeContext, func: Func, p: Parameter): string {
+	if (p.isBindableCallback) return `(${callbackType(ctx, p)})`;
+	const type = ctx.tsType(p.type);
+	if (func.finish && ctx.qualify(p.type.girType) === 'Gio.Cancellable') return `${type} | AbortSignal`;
+	return type;
+}
+
 function params(ctx: TypeContext, func: Func): string {
-	const inParams = func.parameters.filter(p => !p.isInstance && p.direction !== 'out' && !isErrorParam(p));
+	const inParams = func.parameters.filter(
+		p => !p.isInstance && !p.isHidden && p.direction !== 'out' && !isErrorParam(p) && !isReady(ctx, func, p)
+	);
 	// A param may be syntactically optional (`?`) only if every later param is
 	// also optional; otherwise TS rejects "required after optional". A nullable
 	// param that precedes a required one stays required but accepts `| null`.
@@ -56,7 +85,7 @@ function params(ctx: TypeContext, func: Func): string {
 	return inParams
 		.map((p, i) => {
 			const name = parameterName(p.name);
-			const type = ctx.tsType(p.type);
+			const type = paramType(ctx, func, p);
 			const optional = p.nullable && i >= optionalFrom;
 			return `${name}${optional ? '?' : ''}: ${type}${p.nullable ? ' | null' : ''}`;
 		})
@@ -67,10 +96,17 @@ function typed(ctx: TypeContext, type: TypeRef, nullable: boolean): string {
 	return nullable ? `${ctx.tsType(type)} | null` : ctx.tsType(type);
 }
 
-/** The return value alone, the only out parameter of a void function, or else a tuple of the return value and out parameters. */
+/**
+ * The return value alone, the only out parameter of a void function, or else a
+ * tuple of the return value and out parameters; for an asynchronous function, a
+ * promise of its finish function's.
+ */
 function ret(ctx: TypeContext, func: Func): string {
+	if (func.finish) return `Promise<${ret(ctx, func.finish)}>`;
 	const rv = func.returnValue;
-	const outputs = func.parameters.filter(p => !p.isInstance && p.direction !== 'in' && !isErrorParam(p));
+	const outputs = func.parameters.filter(
+		p => !p.isInstance && !p.isHidden && p.direction !== 'in' && !isErrorParam(p)
+	);
 	const returns = rv.type.girType !== 'none';
 	if (!outputs.length) return returns ? typed(ctx, rv.type, rv.nullable) : 'void';
 	if (!returns && outputs.length === 1) return typed(ctx, outputs[0].type, outputs[0].nullable);
@@ -124,16 +160,6 @@ function parameterName(name: string): string {
 	return reserved.has(camel) ? `${camel}_` : camel;
 }
 
-/** Qualify a type name from another namespace's GIR so it resolves in this one. */
-function inNamespace(type: TypeRef, namespace: string): TypeRef {
-	const qualify = (name: string) => (/^[A-Z]/.test(name) && !name.includes('.') ? `${namespace}.${name}` : name);
-	return {
-		...type,
-		girType: qualify(type.girType),
-		elementType: type.elementType && qualify(type.elementType),
-	};
-}
-
 /**
  * Classes from `cls` up to (excluding) the bound parent its declaration
  * extends, each with the namespace that declares it. Their signals are the ones
@@ -160,12 +186,12 @@ function signalMap(ctx: TypeContext, sources: { signals: Signal[]; namespace: st
 			if (seen.has(signal.name)) continue;
 			seen.add(signal.name);
 			const args = signal.parameters.map(p => {
-				const type = ctx.tsType(inNamespace(p.type, namespace));
+				const type = ctx.tsType(qualifyType(p.type, namespace));
 				return `${parameterName(p.name)}: ${type}${p.nullable ? ' | null' : ''}`;
 			});
 			const rv = signal.returnValue;
 			const result =
-				rv.type.girType === 'none' ? 'void' : `${ctx.tsType(inNamespace(rv.type, namespace))} | void`;
+				rv.type.girType === 'none' ? 'void' : `${ctx.tsType(qualifyType(rv.type, namespace))} | void`;
 			entries.push(`'${signal.name}': (${args.join(', ')}) => ${result}`);
 		}
 	}
