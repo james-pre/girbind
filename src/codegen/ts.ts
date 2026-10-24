@@ -22,6 +22,7 @@ import {
 	fields,
 	hasSetter,
 	interfaceOwner,
+	isBoundMethod,
 	isErrorParam,
 	methods,
 	type Owner,
@@ -235,14 +236,69 @@ function ancestorMembers(ctx: TypeContext, qualified: string | undefined): Set<s
 	return names;
 }
 
-function* members(ctx: TypeContext, owner: Owner, inherited = new Set<string>()): Lines {
+/** A function with its types qualified by the namespace declaring it, so it renders from any namespace. */
+function qualifiedFunc(func: Func, namespace: string): Func {
+	return {
+		...func,
+		parameters: func.parameters.map(p => ({ ...p, type: qualifyType(p.type, namespace) })),
+		returnValue: { ...func.returnValue, type: qualifyType(func.returnValue.type, namespace) },
+		finish: func.finish && qualifiedFunc(func.finish, namespace),
+	};
+}
+
+function methodSignature(ctx: TypeContext, func: Func): string {
+	return `${methodName(func)}(${params(ctx, func)}): ${ret(ctx, func)};`;
+}
+
+/**
+ * Signatures of the methods a class's declared ancestors and interfaces have,
+ * by JS name, nearest first. A method overriding one with a different
+ * signature repeats these as overloads, keeping the class assignable to them.
+ */
+function inheritedSignatures(ctx: TypeContext, cls: Class): Map<string, string[]> {
+	const signatures = new Map<string, string[]>();
+	const add = (funcs: Func[], namespace: string) => {
+		for (const func of funcs.filter(isBoundMethod)) {
+			const name = methodName(func);
+			signatures.set(name, [
+				...(signatures.get(name) ?? []),
+				methodSignature(ctx, qualifiedFunc(func, namespace)),
+			]);
+		}
+	};
+	const addInterfaces = (implemented: string[]) => {
+		for (const qualified of implemented) {
+			const iface = ctx.anyInterface(qualified);
+			if (iface && ctx.interfaceReference(qualified)) add(iface.methods, namespaceOf(qualified));
+		}
+	};
+	addInterfaces(cls.implements);
+	for (let qualified = cls.parent; qualified;) {
+		const current = ctx.anyClass(qualified);
+		if (!current) break;
+		const bound = ctx.boundClass(qualified);
+		if (bound.qualified === qualified && bound.source !== 'runtime') {
+			add(current.methods, namespaceOf(qualified));
+			addInterfaces(current.implements);
+		}
+		qualified = current.parent;
+	}
+	return signatures;
+}
+
+function* members(
+	ctx: TypeContext,
+	owner: Owner,
+	inherited = new Set<string>(),
+	signatures = new Map<string, string[]>()
+): Lines {
 	if (owner.primary) yield `\tconstructor(${params(ctx, owner.primary)});`;
 	else if (zeroConstructible(owner)) yield '\tconstructor();';
 	// `protected` (not `private`) so subclasses can still `extends` a return-only
 	// base; the runtime constructor throws for these classes regardless.
 	else yield '\tprotected constructor();';
 	yield* staticMembers(ctx, owner, 'static ');
-	yield* instanceMembers(ctx, owner, inherited);
+	yield* instanceMembers(ctx, owner, inherited, false, signatures);
 }
 
 function* staticMembers(ctx: TypeContext, owner: Owner, modifier: string): Lines {
@@ -251,18 +307,30 @@ function* staticMembers(ctx: TypeContext, owner: Owner, modifier: string): Lines
 }
 
 /**
- * Methods, properties and fields. A member named like an `inherited` one gets
- * `// @ts-ignore`, since a GIR override may change its signature, unless
- * `skipInherited` is set, which leaves it out instead.
+ * Methods, properties and fields. A method with a different signature from an
+ * inherited one also declares the inherited `signatures` as overloads. Any
+ * other member named like an `inherited` one gets `// @ts-ignore`, since a GIR
+ * override may change its type, unless `skipInherited` is set, which leaves it
+ * out instead.
  */
-function* instanceMembers(ctx: TypeContext, owner: Owner, inherited: Set<string>, skipInherited = false): Lines {
+function* instanceMembers(
+	ctx: TypeContext,
+	owner: Owner,
+	inherited: Set<string>,
+	skipInherited = false,
+	signatures = new Map<string, string[]>()
+): Lines {
 	const override = function* (name: string): Lines {
 		if (inherited.has(name)) yield '\t// @ts-ignore';
 	};
 	for (const f of methods(owner)) {
-		if (skipInherited && inherited.has(methodName(f))) continue;
-		yield* override(methodName(f));
-		yield `\t${methodName(f)}(${params(ctx, f)}): ${ret(ctx, f)};`;
+		const name = methodName(f);
+		if (skipInherited && inherited.has(name)) continue;
+		const own = methodSignature(ctx, f);
+		const overloads = new Set((signatures.get(name) ?? []).filter(signature => signature !== own));
+		if (!overloads.size) yield* override(name);
+		yield `\t${own}`;
+		for (const signature of overloads) yield `\t${signature}`;
 	}
 	for (const p of properties(owner)) {
 		if (skipInherited && inherited.has(memberName(p.name))) continue;
@@ -301,7 +369,7 @@ function* classDecl(ctx: TypeContext, cls: Class): Lines {
 	const parent = ctx.classReference(ctx.boundParent(cls).qualified);
 	yield* implementedDecl(ctx, cls);
 	yield `export declare class ${cls.name}<S extends object = {}> extends ${parent}<${signalMap(ctx, classSignals(ctx, cls))} & S> {`;
-	yield* members(ctx, classOwner(ctx, cls), ancestorMembers(ctx, cls.parent));
+	yield* members(ctx, classOwner(ctx, cls), ancestorMembers(ctx, cls.parent), inheritedSignatures(ctx, cls));
 	yield '}';
 	yield '';
 }

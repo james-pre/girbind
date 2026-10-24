@@ -138,8 +138,9 @@ function hasConstructor(owner: Owner): boolean {
 /** Reference-counting and freeing methods, which would unbalance the reference a wrapper owns. */
 const lifecycleMethods = new Set(['ref', 'unref', 'ref_sink', 'free']);
 
-export const methods = (owner: Owner) =>
-	owner.members.methods.filter(func => isSupported(func) && !lifecycleMethods.has(func.name));
+/** Whether an instance method is bound: supported, and not one that would unbalance a wrapper's reference. */
+export const isBoundMethod = (func: Func) => isSupported(func) && !lifecycleMethods.has(func.name);
+export const methods = (owner: Owner) => owner.members.methods.filter(isBoundMethod);
 export const statics = (owner: Owner) => owner.members.staticMethods.filter(isSupported);
 /** The constructor bound to JS `new`: `new` (or the first constructor) for classes, only `new` for records. */
 function primaryOf(owner: Owner): Func | undefined {

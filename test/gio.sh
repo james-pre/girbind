@@ -28,6 +28,24 @@ mkdir -p "$out"
 echo '{ "name": "gio-test", "private": true, "type": "module", "girbindDependencies": ["gio"] }' >"$out/package.json"
 (cd "$out" && node "$project_dir/dist/main.js" build)
 
+echo "==> Type-checking the declarations"
+node test/assignability.js "$out/native" "$out/native/assignability.ts"
+cat >"$out/tsconfig.json" <<'EOF'
+{
+	"compilerOptions": {
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"target": "ESNext",
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": false,
+		"types": ["node"]
+	},
+	"files": ["native/assignability.ts"]
+}
+EOF
+npx tsc -p "$out/tsconfig.json"
+
 echo "==> Running usage test"
 node test/gio.js "$out/native/gio.js"
 
