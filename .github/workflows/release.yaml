@@ -97,7 +97,7 @@ jobs:
                   sha256sum runtime/dist/*.node
 
             - name: Publish girbind
-              run: npm publish --workspace girbind --access=public --provenance
+              run: npm publish --workspace girbind --access=public --provenance ${{ github.event.release.prerelease && '--tag next' || '' }}
 
             - name: Publish girbind-devel
-              run: npm publish --access=public --provenance
+              run: npm publish --access=public --provenance ${{ github.event.release.prerelease && '--tag next' || '' }}
