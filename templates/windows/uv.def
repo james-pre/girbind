@@ -1,0 +1,17 @@
+uv_async_init
+uv_check_init
+uv_check_start
+uv_close
+uv_handle_get_data
+uv_handle_set_data
+uv_handle_size
+uv_poll_init
+uv_poll_start
+uv_poll_stop
+uv_prepare_init
+uv_prepare_start
+uv_ref
+uv_timer_init
+uv_timer_start
+uv_timer_stop
+uv_unref

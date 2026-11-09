@@ -229,6 +229,9 @@ interface FuncKind {
 	isStatic?: boolean;
 }
 
+/** Functions that libraries declare for their loadable modules to define, which the libraries themselves don't export */
+const moduleEntryPoints = new Set(['g_io_module_query', 'g_io_module_load', 'g_io_module_unload']);
+
 function parseFunction(node: Node, kind: FuncKind): Func | undefined {
 	const name = attr(node, 'name');
 	if (!name) return undefined;
@@ -245,16 +248,17 @@ function parseFunction(node: Node, kind: FuncKind): Func | undefined {
 		}
 	}
 
+	const cName = attr(node, 'c:identifier') ?? name;
 	return {
 		name,
-		cName: attr(node, 'c:identifier') ?? name,
+		cName,
 		parameters: params,
 		returnValue: parseReturnValue(child(node, 'return-value')),
 		isMethod: kind.isMethod ?? false,
 		isConstructor: kind.isConstructor ?? false,
 		isStatic: kind.isStatic ?? false,
 		throws: boolAttr(node, 'throws'),
-		introspectable: boolAttr(node, 'introspectable', true),
+		introspectable: boolAttr(node, 'introspectable', true) && !moduleEntryPoints.has(cName),
 		shadows: attr(node, 'shadows'),
 		finishName: attr(node, 'glib:finish-func'),
 	};

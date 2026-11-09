@@ -5,3 +5,4 @@ export * from './names.js';
 export * from './parse.js';
 export * from './scaffold.js';
 export * from './types.js';
+export * as windows from './windows/index.js';

@@ -45,9 +45,41 @@ jobs:
               id: deploy
               uses: actions/deploy-pages@v4
 
-    release:
+    windows-runtime:
+        name: Build runtime for win32-x64
         runs-on: ubuntu-latest
         needs: ci
+        container: fedora:latest
+        steps:
+            - name: Install native dependencies
+              run: dnf install -y git cmake make pkgconf-pkg-config ucrt64-gcc-c++
+
+            - name: Checkout
+              uses: actions/checkout@v5
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v6
+              with:
+                  node-version: latest
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Build
+              run: npm run build
+
+            - name: Cross-compile runtime
+              run: node dist/main.js runtime --target win32-x64 --outdir runtime/dist
+
+            - name: Upload runtime
+              uses: actions/upload-artifact@v4
+              with:
+                  name: girbind-win32-x64
+                  path: runtime/dist/girbind.win32-x64.node
+
+    release:
+        runs-on: ubuntu-latest
+        needs: [ci, windows-runtime]
         container: debian:stable
         permissions:
             id-token: write
@@ -90,10 +122,17 @@ jobs:
                   --CDCMAKE_SYSTEM_NAME=Linux --CDCMAKE_SYSTEM_PROCESSOR=aarch64
                   --CDCMAKE_C_COMPILER=aarch64-linux-gnu-gcc --CDCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
 
+            - name: Download runtime for win32-x64
+              uses: actions/download-artifact@v4
+              with:
+                  name: girbind-win32-x64
+                  path: runtime/dist
+
             - name: Check runtime binaries
               run: |
                   readelf -h runtime/dist/girbind.linux-x64.node | grep -q 'X86-64'
                   readelf -h runtime/dist/girbind.linux-arm64.node | grep -q 'AArch64'
+                  head -c 2 runtime/dist/girbind.win32-x64.node | grep -q 'MZ'
                   sha256sum runtime/dist/*.node
 
             - name: Publish girbind

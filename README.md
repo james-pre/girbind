@@ -76,6 +76,36 @@ them). For a library girbind doesn't ship a config for, add an entry to
 that depend on each other (for example `gtk` on `gdk` and `gio`) import each
 other, so objects pass between them.
 
+### Building for Windows
+
+`build --target win32-x64` builds `<name>.win32-x64.node` files next to the
+others in `native/`, and the generated entry points load them on Windows. It
+works on Linux, cross-compiling, and on Windows from an MSYS2 UCRT64 shell. It
+needs CMake, `pkg-config` and MinGW-w64 targeting UCRT (on Fedora,
+`ucrt64-gcc-c++`).
+
+```sh
+npx girbind build                       # entry points and the .node files for this platform
+npx girbind build --target win32-x64    # also native/<name>.win32-x64.node
+npx girbind dlls --target win32-x64 dll # the DLLs those need, into dll/
+```
+
+The libraries, headers and GIR files come from [MSYS2](https://www.msys2.org/)'s
+UCRT64 packages, which girbind downloads into
+`node_modules/.cache/girbind/win32-x64` (or `--sysroot <dir>`). The sources for
+Windows are generated from MSYS2's GIR files, leaving out headers and
+`pkg-config` modules Windows doesn't have, such as `gtk4-unix-print`. Inline
+configs name their MSYS2 packages with an `msys2` field, e.g. `["gtk4"]`. Set
+`GIRBIND_MINGW` to the MinGW tools' prefix if it isn't
+`x86_64-w64-mingw32ucrt-`.
+
+Windows only finds DLLs on `PATH` or next to the program, so add the directory
+`dlls` copied them into to `PATH` before importing any bindings. Addons load
+Node-API from whichever program runs them, so they also work in single
+executable applications. The `girbind` package comes with its runtime built for
+Windows; `npx girbind runtime --target win32-x64` builds it for a version that
+doesn't.
+
 ### 2. Author: publish a bindings package
 
 Use this when you maintain a standalone bindings package to publish to npm.

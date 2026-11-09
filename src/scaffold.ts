@@ -6,7 +6,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { type DepEntry, type NamedDep, resolveDep } from './deps.js';
+import { type DepEntry, type NamedDep, type ResolvedDep, resolveDep } from './deps.js';
 
 /** Directory holding the shipped templates, resolved relative to this module. */
 const templatesDir = join(import.meta.dirname, '..', 'templates');
@@ -57,6 +57,8 @@ export function writeCMakeLists(opts: WriteCmakeOptions) {
 export interface CMakeTarget {
 	/** Addon name; the output is `<name>.node`. */
 	name: string;
+	/** File name of the output without `.node`, if it isn't the addon name */
+	outputName?: string;
 	/** Directory holding this addon's `.cxx`, relative to the CMake root. */
 	srcDir: string;
 	/** pkg-config modules to require for this addon. */
@@ -82,7 +84,7 @@ function targetBlock(target: CMakeTarget): string {
 		`file(GLOB ${target.name}_SRC "${target.srcDir}/*.cxx")`,
 		`add_library(${target.name}_addon SHARED \${${target.name}_SRC} \${CMAKE_JS_SRC})`,
 		`set_target_properties(${target.name}_addon PROPERTIES`,
-		`\tOUTPUT_NAME "${target.name}"`,
+		`\tOUTPUT_NAME "${target.outputName ?? target.name}"`,
 		'\tPREFIX ""',
 		'\tSUFFIX ".node"',
 		'\tLIBRARY_OUTPUT_DIRECTORY "${GIRBIND_OUTPUT_DIR}"',
@@ -113,21 +115,26 @@ export const GIRBIND_DIR = 'girbind';
 
 /** Write `girbind/CMakeLists.txt` with one target per dependency. */
 export function writeAggregateCMake(root: string, deps: DepEntry[]): void {
-	const girbindRoot = join(root, GIRBIND_DIR);
-	mkdirSync(girbindRoot, { recursive: true });
+	writeDirectoryCMake(join(root, GIRBIND_DIR), deps.map(resolveDep), resolve(root, 'native'));
+}
+
+/**
+ * Write a CMakeLists.txt in `directory` with one target per dependency, whose sources are in subdirectories named after them.
+ * @param suffix Added to each addon's file name, e.g. `.win32-x64`
+ */
+export function writeDirectoryCMake(directory: string, deps: ResolvedDep[], outputDir: string, suffix = ''): void {
+	mkdirSync(directory, { recursive: true });
 	writeFileSync(
-		join(girbindRoot, 'CMakeLists.txt'),
+		join(directory, 'CMakeLists.txt'),
 		renderAggregateCMakeLists({
 			projectName: 'girbind_addons',
-			outputDir: resolve(root, 'native'),
-			targets: deps.map(entry => {
-				const dep = resolveDep(entry);
-				return {
-					name: dep.name,
-					srcDir: dep.name,
-					pkgConfigModules: [...BASE_PKGCONFIG, ...dep.pkgConfig],
-				};
-			}),
+			outputDir,
+			targets: deps.map(dep => ({
+				name: dep.name,
+				outputName: dep.name + suffix,
+				srcDir: dep.name,
+				pkgConfigModules: [...BASE_PKGCONFIG, ...dep.pkgConfig],
+			})),
 		})
 	);
 }

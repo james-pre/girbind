@@ -17,6 +17,8 @@ export interface LibraryConfig {
 	pkgConfig: string[];
 	/** Preprocessor macros to define before the includes, e.g. `G_SETTINGS_ENABLE_BACKEND`. */
 	defines?: string[];
+	/** MSYS2 packages with the library, for building Windows addons, e.g. `gtk4` */
+	msys2?: string[];
 }
 
 /** A built-in config plus its name (the configs.json key). */
@@ -66,6 +68,7 @@ export function resolveDep(entry: DepEntry): ResolvedDep {
 		include: entry.include,
 		pkgConfig: entry.pkgConfig,
 		defines: entry.defines,
+		msys2: entry.msys2,
 	};
 }
 

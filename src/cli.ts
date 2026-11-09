@@ -1,12 +1,14 @@
 import { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { copyFileSync, existsSync, globSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { basename, dirname, join, resolve } from 'node:path';
 import $pkg from '../package.json' with { type: 'json' };
 import { generatePackage, siblingModules } from './codegen/index.js';
 import { builtinNames, type DepEntry, depName, readPackageJson, resolveDep, writePackageJson } from './deps.js';
 import { parseGirFile } from './parse.js';
-import { GIRBIND_DIR, writeAggregateCMake, writeCMakeLists } from './scaffold.js';
+import { GIRBIND_DIR, writeAggregateCMake, writeCMakeLists, writeDirectoryCMake } from './scaffold.js';
+import * as windows from './windows/index.js';
 
 const cli = new Command('girbind').version($pkg.version).description($pkg.description);
 
@@ -85,15 +87,30 @@ cli.command('remove')
 		generateAll(opts.root, remaining);
 	});
 
+const targetOption = `platform to build for instead of this one, as <platform>-<arch>: ${windows.targets.join(', ')}`;
+const sysrootOption = 'where libraries for the target are downloaded (default: node_modules/.cache/girbind/<target>)';
+
+/** Where libraries for a target are downloaded, unless another directory is given */
+function defaultSysroot(root: string, target: string): string {
+	return join(root, 'node_modules/.cache/girbind', target);
+}
+
 cli.command('build')
 	.description('Build all girbindDependencies and colocate the JS + types with each .node')
 	.option('--root <dir>', 'project root (where package.json lives)', '.')
 	.option('--build-dir <dir>', 'directory the built .node files (and copied js/d.ts) go in', 'native')
-	.action((opts: { root: string; buildDir: string }) => {
+	.option('-t, --target <target>', targetOption + '; only builds <name>.<target>.node files')
+	.option('--sysroot <dir>', sysrootOption)
+	.action(async (opts: { root: string; buildDir: string; target?: string; sysroot?: string }) => {
 		const pkg = readPackageJson(join(opts.root, 'package.json'));
 		const deps = pkg.girbindDependencies ?? [];
 		if (!deps.length) {
 			console.error('No girbindDependencies to build. Use `girbind add <package>` first.');
+			return;
+		}
+
+		if (opts.target) {
+			await buildTarget(opts.root, deps, opts.target, join(opts.root, opts.buildDir), opts.sysroot);
 			return;
 		}
 
@@ -130,6 +147,66 @@ cli.command('compile')
 		}
 		console.error(`Built ${name}.node into ${opts.outdir}/`);
 	});
+
+cli.command('runtime')
+	.description("Build the girbind runtime for a target, for when the installed girbind doesn't come with one")
+	.requiredOption('-t, --target <target>', targetOption)
+	.option('--root <dir>', 'project root (where package.json lives)', '.')
+	.option('--sysroot <dir>', sysrootOption)
+	.option('-o, --outdir <dir>', "directory girbind.<target>.node goes in (default: the installed runtime's)")
+	.action(async (opts: { target: string; root: string; sysroot?: string; outdir?: string }) => {
+		windows.checkTarget(opts.target);
+		const sysroot = resolve(opts.sysroot ?? defaultSysroot(opts.root, opts.target));
+		await windows.prepareSysroot([], sysroot);
+		const runtime = dirname(createRequire(resolve(opts.root, 'package.json')).resolve('girbind/package.json'));
+		const outdir = resolve(opts.outdir ?? join(runtime, 'dist'));
+		windows.compile(runtime, join(sysroot, 'runtime-build'), sysroot, {
+			GIRBIND_OUTPUT_DIR: outdir,
+			GIRBIND_OUTPUT_NAME: 'girbind.' + opts.target,
+		});
+		console.error(`Built girbind.${opts.target}.node into ${outdir}/`);
+	});
+
+cli.command('dlls')
+	.description('Copy the DLLs that addons built for a target need into a directory, along with the DLLs those need')
+	.argument('<outdir>', 'directory to copy the DLLs into')
+	.requiredOption('-t, --target <target>', targetOption)
+	.option('--root <dir>', 'project root (where package.json lives)', '.')
+	.option('--build-dir <dir>', 'directory with the built .node files', 'native')
+	.option('--sysroot <dir>', sysrootOption)
+	.action((outdir: string, opts: { target: string; root: string; buildDir: string; sysroot?: string }) => {
+		windows.checkTarget(opts.target);
+		const sysroot = resolve(opts.sysroot ?? defaultSysroot(opts.root, opts.target));
+		const runtime = dirname(createRequire(resolve(opts.root, 'package.json')).resolve('girbind/package.json'));
+		const buildDir = join(opts.root, opts.buildDir);
+		const addons = [
+			...globSync(`*.${opts.target}.node`, { cwd: buildDir }).map(name => join(buildDir, name)),
+			join(runtime, 'dist', `girbind.${opts.target}.node`),
+		].filter(path => existsSync(path));
+		const dlls = windows.pe.dependencies(addons, join(windows.prefix(sysroot), 'bin'));
+		mkdirSync(outdir, { recursive: true });
+		for (const dll of dlls) copyFileSync(dll, join(outdir, basename(dll)));
+		console.error(`Copied ${dlls.length} DLLs that ${addons.length} addons need into ${outdir}/`);
+	});
+
+/** Generate sources for a target from its sysroot's GIR files and build `<name>.<target>.node` files */
+async function buildTarget(root: string, entries: DepEntry[], target: string, buildDir: string, sysroot?: string) {
+	windows.checkTarget(target);
+	sysroot = resolve(sysroot ?? defaultSysroot(root, target));
+	const resolved = entries.map(resolveDep);
+	await windows.prepareSysroot(resolved, sysroot);
+	const deps = windows.forSysroot(resolved, sysroot);
+
+	const directory = join(root, GIRBIND_DIR, target);
+	const { namespaces, modules } = siblingModules(deps);
+	for (const dep of deps) generatePackage(dep, join(directory, dep.name), namespaces.get(dep), modules);
+	writeDirectoryCMake(directory, deps, resolve(buildDir), '.' + target);
+
+	mkdirSync(buildDir, { recursive: true });
+	windows.compile(directory, join(directory, '.cmake-build'), sysroot, { GIRBIND_OUTPUT_DIR: resolve(buildDir) });
+	console.error(`Built ${deps.length} package(s) for ${target} into ${buildDir}/`);
+	for (const dep of deps) console.error(`  ${dep.name}.${target}.node`);
+}
 
 /**
  * Regenerate every dependency's sources (only rewriting changed files) and the

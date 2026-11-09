@@ -8,36 +8,43 @@
 		"include": ["gio/gio.h", "gio/gsettingsbackend.h", "gio/gnetworking.h"],
 		"defines": ["G_SETTINGS_ENABLE_BACKEND"],
 		"pkgConfig": ["gio-2.0"],
+		"msys2": ["glib2"],
 		"gir": "/usr/share/gir-1.0/Gio-2.0.gir"
 	},
 	"graphene": {
 		"include": ["graphene-gobject.h"],
 		"pkgConfig": ["graphene-gobject-1.0"],
+		"msys2": ["graphene"],
 		"gir": "/usr/share/gir-1.0/Graphene-1.0.gir"
 	},
 	"pango": {
 		"include": ["pango/pango.h"],
-		"pkgConfig": ["pango"],
+		"pkgConfig": ["pango", "harfbuzz-gobject"],
+		"msys2": ["pango"],
 		"gir": "/usr/share/gir-1.0/Pango-1.0.gir"
 	},
 	"gdk": {
 		"include": ["gdk/gdk.h"],
 		"pkgConfig": ["gtk4"],
+		"msys2": ["gtk4"],
 		"gir": "/usr/share/gir-1.0/Gdk-4.0.gir"
 	},
 	"gsk": {
 		"include": ["gsk/gsk.h", "gsk/broadway/gskbroadwayrenderer.h"],
 		"pkgConfig": ["gtk4"],
+		"msys2": ["gtk4"],
 		"gir": "/usr/share/gir-1.0/Gsk-4.0.gir"
 	},
 	"gtk": {
 		"include": ["gtk/gtk.h", "gtk/gtkunixprint.h"],
 		"pkgConfig": ["gtk4", "gtk4-unix-print"],
+		"msys2": ["gtk4"],
 		"gir": "/usr/share/gir-1.0/Gtk-4.0.gir"
 	},
 	"adw": {
 		"include": ["adwaita.h"],
 		"pkgConfig": ["libadwaita-1"],
+		"msys2": ["libadwaita"],
 		"gir": "/usr/share/gir-1.0/Adw-1.gir"
 	}
 }

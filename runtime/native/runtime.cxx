@@ -157,6 +157,11 @@ struct Pump {
 
 Pump *pump = nullptr;
 
+#ifdef G_OS_WIN32
+/** How often GLib's sources are checked on Windows, in milliseconds, since libuv can't wait on message queues or handles there */
+constexpr gint windows_poll_interval = 10;
+#endif
+
 bool on_main_thread() {
 	return pump && std::this_thread::get_id() == pump->thread;
 }
@@ -233,6 +238,10 @@ void on_prepare(uv_handle_t *) {
 	}
 	pump->prepared = true;
 
+#ifdef G_OS_WIN32
+	gint wait = timeout >= 0 && timeout < windows_poll_interval ? timeout : windows_poll_interval;
+	uv_timer_start(pump->timer, on_timer, static_cast<uint64_t>(wait), 0);
+#else
 	std::map<int, int> wanted;
 	for (const GPollFD &fd : pump->fds)
 		wanted[fd.fd] |= uv_events(fd.events);
@@ -272,6 +281,7 @@ void on_prepare(uv_handle_t *) {
 		uv_timer_start(pump->timer, on_timer, static_cast<uint64_t>(timeout), 0);
 	else
 		uv_timer_stop(pump->timer);
+#endif
 }
 
 /** Dispatch the GLib sources that became ready, inside a Node callback scope so microtasks run after. */
@@ -279,6 +289,9 @@ void on_check(uv_handle_t *) {
 	if (!pump->prepared)
 		return;
 	pump->prepared = false;
+#ifdef G_OS_WIN32
+	g_poll(pump->fds.data(), static_cast<guint>(pump->fds.size()), 0);
+#else
 	for (GPollFD &fd : pump->fds) {
 		auto watch = pump->watches.find(fd.fd);
 		int fired = watch == pump->watches.end() ? 0 : watch->second.fired;
@@ -286,6 +299,7 @@ void on_check(uv_handle_t *) {
 	}
 	for (auto &[fd, watch] : pump->watches)
 		watch.fired = 0;
+#endif
 
 	if (g_main_context_check(
 			pump->context, pump->max_priority, pump->fds.data(), static_cast<gint>(pump->fds.size())
