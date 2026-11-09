@@ -52,7 +52,7 @@ jobs:
         container: fedora:latest
         steps:
             - name: Install native dependencies
-              run: dnf install -y git cmake make pkgconf-pkg-config ucrt64-gcc-c++
+              run: dnf install -y git cmake make pkgconf-pkg-config ucrt64-gcc-c++ libatomic
 
             - name: Checkout
               uses: actions/checkout@v5
